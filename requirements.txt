@@ -1,0 +1,4 @@
+# Dependências de Produção da Triagem VRE
+openpyxl>=3.1.2
+xlrd>=2.0.1
+pyinstaller>=6.5.0

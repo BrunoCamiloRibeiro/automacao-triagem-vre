@@ -1,0 +1,687 @@
+"""Serviço de Negócio para Gestão de Arquivamento e Visibilidade de Competências.
+
+Implementa a rotina institucional de Arquivamento por Mês de Competência:
+- "Arquivado = Sim": Oculto da planilha de trabalho atual (Planilha_Controle_VRE_Ativa.xlsx).
+- "Arquivado = Não" (Ativo): Visível na planilha de trabalho atual.
+- Ao aplicar alterações:
+  1. A planilha de trabalho que estava sendo usada é salva como backup em /Planilhas anteriores.
+  2. Gera uma nova planilha ativa com todos os meses selecionados como ativos,
+     juntamente com quaisquer novos registros recebidos via CSV.
+  3. Os registros permanecem sempre íntegros e preservados no banco SQLite (vre_backlog).
+- Pesquisa multi-critério de fiscais históricos por CNPJ ou Razão Social.
+"""
+
+from __future__ import annotations
+
+import datetime
+import os
+import shutil
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+from src.core.config import (
+    BASE_DIR,
+    OUTPUT_XLSX_PATH,
+    PLANILHAS_ANTERIORES_DIR,
+    resolve_output_xlsx_path,
+    resolve_template_path,
+)
+from src.core.database import db_transaction, get_triagem_db, initialize_schema_if_needed
+from src.core.excel_writer import gerar_planilha_trabalho
+from src.core.normalizer import formatar_cnpj, normalizar_cnpj
+
+
+def garantir_tabela_controle(conn: sqlite3.Connection) -> None:
+    """Garante que a tabela controle_competencias exista e esteja sincronizada."""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS controle_competencias (
+            mes_competencia TEXT PRIMARY KEY,
+            arquivado INTEGER DEFAULT 0,
+            atualizado_em DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_comp_arquivado ON controle_competencias(arquivado);")
+    # Sincroniza qualquer competência existente no backlog que ainda não conste no controle
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO controle_competencias (mes_competencia, arquivado)
+        SELECT DISTINCT mes_competencia, 0
+        FROM vre_backlog
+        WHERE mes_competencia IS NOT NULL AND TRIM(mes_competencia) != '';
+        """
+    )
+
+
+def sincronizar_competencias(conn: sqlite3.Connection | None = None) -> None:
+    """Sincroniza os meses do backlog com a tabela controle_competencias."""
+    close_conn = False
+    if conn is None:
+        conn = get_triagem_db()
+        close_conn = True
+    try:
+        initialize_schema_if_needed(conn, is_cep=False)
+        garantir_tabela_controle(conn)
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def obter_estatisticas_gerais(conn: sqlite3.Connection | None = None) -> dict[str, int]:
+    """Retorna contadores gerais do backlog, competências e histórico."""
+    close_conn = False
+    if conn is None:
+        conn = get_triagem_db()
+        close_conn = True
+
+    try:
+        initialize_schema_if_needed(conn, is_cep=False)
+        garantir_tabela_controle(conn)
+        cur = conn.cursor()
+
+        cur.execute("SELECT COUNT(*) FROM vre_backlog;")
+        total_backlog = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM vre_backlog WHERE status = 'PENDENTE';")
+        total_pendentes = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM vre_backlog WHERE status = 'DISTRIBUIDO';")
+        total_distribuidos = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM vre_backlog WHERE status = 'FINALIZADO';")
+        total_finalizados = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM historico_fiscais;")
+        total_historico = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM controle_competencias;")
+        meses_cadastrados = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM controle_competencias WHERE arquivado = 0;")
+        meses_ativos = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM controle_competencias WHERE arquivado = 1;")
+        meses_arquivados = cur.fetchone()[0]
+
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM vre_backlog
+            WHERE status IN ('PENDENTE', 'DISTRIBUIDO')
+              AND mes_competencia NOT IN (
+                  SELECT mes_competencia FROM controle_competencias WHERE arquivado = 1
+              );
+            """
+        )
+        protocolos_ativos_visiveis = cur.fetchone()[0]
+
+        return {
+            "total_backlog": total_backlog,
+            "total_pendentes": total_pendentes,
+            "total_distribuidos": total_distribuidos,
+            "total_finalizados": total_finalizados,
+            "total_historico": total_historico,
+            "meses_cadastrados": meses_cadastrados,
+            "meses_ativos": meses_ativos,
+            "meses_arquivados": meses_arquivados,
+            "protocolos_ativos_visiveis": protocolos_ativos_visiveis,
+        }
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def listar_competencias_status(
+    conn: sqlite3.Connection | None = None,
+) -> list[dict[str, Any]]:
+    """Lista todos os meses de competência e sua condição de arquivamento (visibilidade)."""
+    close_conn = False
+    if conn is None:
+        conn = get_triagem_db()
+        close_conn = True
+
+    try:
+        initialize_schema_if_needed(conn, is_cep=False)
+        garantir_tabela_controle(conn)
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT
+                c.mes_competencia,
+                c.arquivado,
+                COUNT(b.protocolo_licenca) as total,
+                SUM(CASE WHEN b.status = 'PENDENTE' THEN 1 ELSE 0 END) as pendentes,
+                SUM(CASE WHEN b.status = 'DISTRIBUIDO' THEN 1 ELSE 0 END) as distribuidos,
+                SUM(CASE WHEN b.status = 'FINALIZADO' THEN 1 ELSE 0 END) as finalizados
+            FROM controle_competencias c
+            LEFT JOIN vre_backlog b ON b.mes_competencia = c.mes_competencia
+            GROUP BY c.mes_competencia
+            ORDER BY c.mes_competencia DESC;
+            """
+        )
+        linhas = []
+        for r in cur.fetchall():
+            tot = r["total"] or 0
+            fin = r["finalizados"] or 0
+            pend = r["pendentes"] or 0
+            dist = r["distribuidos"] or 0
+            arq = bool(r["arquivado"])
+            taxa_conclusao = (fin / tot * 100) if tot > 0 else 0.0
+
+            status_desc = "📦 Arquivado (Oculto da Planilha)" if arq else "✅ Ativo (Visível na Planilha)"
+
+            linhas.append(
+                {
+                    "mes_competencia": r["mes_competencia"],
+                    "arquivado": arq,
+                    "status_texto": status_desc,
+                    "total": tot,
+                    "finalizados": fin,
+                    "pendentes": pend,
+                    "distribuidos": dist,
+                    "taxa_conclusao": round(taxa_conclusao, 1),
+                    "pode_arquivar": True,  # Qualquer mês pode ser arquivado/ocultado a critério do usuário
+                }
+            )
+        return linhas
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def definir_status_competencia(
+    mes_competencia: str,
+    arquivado: bool,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Define se uma competência deve estar arquivada (oculta) ou ativa (visível)."""
+    comp_limpa = str(mes_competencia).strip()
+    if not comp_limpa:
+        return False
+
+    close_conn = False
+    if conn is None:
+        conn = get_triagem_db()
+        close_conn = True
+
+    try:
+        initialize_schema_if_needed(conn, is_cep=False)
+        garantir_tabela_controle(conn)
+        val_arq = 1 if arquivado else 0
+        with db_transaction(conn) as cur:
+            cur.execute(
+                """
+                INSERT INTO controle_competencias (mes_competencia, arquivado, atualizado_em)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(mes_competencia) DO UPDATE SET
+                    arquivado = excluded.arquivado,
+                    atualizado_em = CURRENT_TIMESTAMP;
+                """,
+                (comp_limpa, val_arq),
+            )
+        return True
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def alternar_status_competencia(
+    mes_competencia: str,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Alterna o status de arquivamento (Ativo <-> Arquivado) de um mês."""
+    comp_limpa = str(mes_competencia).strip()
+    if not comp_limpa:
+        return False
+
+    close_conn = False
+    if conn is None:
+        conn = get_triagem_db()
+        close_conn = True
+
+    try:
+        initialize_schema_if_needed(conn, is_cep=False)
+        garantir_tabela_controle(conn)
+        cur = conn.cursor()
+        cur.execute("SELECT arquivado FROM controle_competencias WHERE mes_competencia = ?;", (comp_limpa,))
+        row = cur.fetchone()
+        novo_status = 1 if (not row or row["arquivado"] == 0) else 0
+
+        with db_transaction(conn) as t_cur:
+            t_cur.execute(
+                """
+                INSERT INTO controle_competencias (mes_competencia, arquivado, atualizado_em)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(mes_competencia) DO UPDATE SET
+                    arquivado = excluded.arquivado,
+                    atualizado_em = CURRENT_TIMESTAMP;
+                """,
+                (comp_limpa, novo_status),
+            )
+        return novo_status == 1
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def arquivar_competencia(
+    mes_competencia: str,
+    forcar: bool = False,
+    conn: sqlite3.Connection | None = None,
+) -> tuple[int, str]:
+    """Marca a competência como arquivada (oculta da planilha de trabalho atual)
+
+    e sincroniza atendimentos finalizados com fiscal para o histórico permanente.
+    """
+    comp_limpa = str(mes_competencia).strip()
+    close_conn = False
+    if conn is None:
+        conn = get_triagem_db()
+        close_conn = True
+
+    try:
+        initialize_schema_if_needed(conn, is_cep=False)
+        garantir_tabela_controle(conn)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM vre_backlog WHERE mes_competencia = ?;", (comp_limpa,))
+        total_prot = cur.fetchone()[0]
+
+        # Sincroniza atendimentos finalizados com fiscal para historico_fiscais
+        with db_transaction(conn) as t_cur:
+            t_cur.execute(
+                """
+                INSERT INTO historico_fiscais (cnpj_limpo, fiscal, data_atendimento, origem_registro)
+                SELECT
+                    cnpj_limpo,
+                    TRIM(fiscal_atribuido),
+                    COALESCE(data_finalizacao, DATE('now')),
+                    ('Mes_' || mes_competencia)
+                FROM vre_backlog
+                WHERE mes_competencia = ?
+                  AND status = 'FINALIZADO'
+                  AND cnpj_limpo != ''
+                  AND fiscal_atribuido IS NOT NULL
+                  AND TRIM(fiscal_atribuido) != ''
+                  AND fiscal_atribuido != 'Não Informado'
+                ON CONFLICT(cnpj_limpo, fiscal) DO UPDATE SET
+                    data_atendimento = excluded.data_atendimento;
+                """,
+                (comp_limpa,),
+            )
+
+        definir_status_competencia(comp_limpa, arquivado=True, conn=conn)
+        return total_prot, f"Mês {comp_limpa} arquivado com sucesso ({total_prot} protocolos arquivados da planilha ativa)."
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def reativar_competencia(
+    mes_competencia: str,
+    conn: sqlite3.Connection | None = None,
+) -> tuple[int, str]:
+    """Reativa a competência (passa a constar na planilha de trabalho atual)."""
+    comp_limpa = str(mes_competencia).strip()
+    ok = definir_status_competencia(comp_limpa, arquivado=False, conn=conn)
+    if ok:
+        return 1, f"Mês {comp_limpa} reativado com sucesso (seus registros constarão na planilha de trabalho ativa)."
+    return 0, f"Falha ao reativar competência {comp_limpa}."
+
+
+def fazer_backup_planilha_ativa(
+    caminho_planilha: Path | str | None = None,
+) -> Path | None:
+    """Gera cópia de segurança datada da planilha de trabalho ativa em /Planilhas anteriores."""
+    p_origem = Path(caminho_planilha) if caminho_planilha else resolve_output_xlsx_path()
+    if not p_origem.exists() or p_origem.stat().st_size == 0:
+        return None
+
+    PLANILHAS_ANTERIORES_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    nome_backup = f"Planilha_Controle_VRE_Ativa_anterior_{timestamp}.xlsx"
+    p_destino = PLANILHAS_ANTERIORES_DIR / nome_backup
+
+    try:
+        shutil.copy2(str(p_origem), str(p_destino))
+        return p_destino
+    except Exception:
+        # Em caso de bloqueio temporário por estar aberto em outro programa
+        try:
+            with open(p_origem, "rb") as f_in, open(p_destino, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            return p_destino
+        except Exception:
+            return None
+
+
+def aplicar_reorganizacao_planilha(
+    conn: sqlite3.Connection | None = None,
+    saida_xlsx: Path | str | None = None,
+    caminho_template: Path | str | None = None,
+) -> dict[str, Any]:
+    """Aplica as alterações de visibilidade e gera a nova planilha de trabalho ativa.
+
+    1. Copia a planilha de trabalho atual para 'Planilhas anteriores/' (backup datado).
+    2. Processa novos arquivos CSV caso existam na raiz ou na pasta de entrada.
+    3. Consulta todos os protocolos do backlog cujos meses NÃO estejam arquivados.
+    4. Gera a nova Planilha_Controle_VRE_Ativa.xlsx institucional de 32 colunas.
+    """
+    # 1. Backup da planilha em uso
+    backup_path = fazer_backup_planilha_ativa(caminho_planilha=saida_xlsx)
+
+    # 2. Se houver novo CSV pendente, processa-o via runner seco
+    from src.runner.main_seco import localizar_arquivo_csv, processar_fluxo_seco
+
+    csv_pendente = localizar_arquivo_csv()
+    csv_nome = None
+
+    if csv_pendente is not None and csv_pendente.exists():
+        csv_nome = csv_pendente.name
+        # Executa o runner seco que já inclui o novo CSV e respeita as competências
+        linhas_geradas = processar_fluxo_seco(
+            caminho_csv=csv_pendente,
+            saida_xlsx=saida_xlsx,
+            template_path=caminho_template,
+            silencioso=True,
+        )
+    else:
+        # Se não há CSV novo, monta a planilha a partir do banco de dados respeitando os meses ativos
+        close_conn = False
+        if conn is None:
+            conn = get_triagem_db()
+            close_conn = True
+
+        try:
+            initialize_schema_if_needed(conn, is_cep=False)
+            garantir_tabela_controle(conn)
+            cur = conn.cursor()
+
+            cur.execute(
+                """
+                SELECT
+                    protocolo_licenca, protocolo_sil, cnpj_limpo, cnpj_formatado,
+                    nome_empresarial, mes_competencia, data_importacao,
+                    bairro_original, area, cnaes_licenciadas, fiscal_atribuido,
+                    flag_restricao, flag_noturno, tipo_servico, status,
+                    data_finalizacao, dados_extras_json
+                FROM vre_backlog
+                WHERE status IN ('PENDENTE', 'DISTRIBUIDO')
+                  AND mes_competencia NOT IN (
+                      SELECT mes_competencia FROM controle_competencias WHERE arquivado = 1
+                  )
+                ORDER BY mes_competencia ASC, data_importacao ASC, protocolo_sil ASC;
+                """
+            )
+            linhas_backlog = [dict(r) for r in cur.fetchall()]
+
+            p_saida = Path(saida_xlsx) if saida_xlsx else resolve_output_xlsx_path()
+            p_tpl = Path(caminho_template) if caminho_template else resolve_template_path()
+
+            gerar_planilha_trabalho(
+                registros_backlog=linhas_backlog,
+                caminho_saida=p_saida,
+                caminho_template=p_tpl,
+            )
+            linhas_geradas = len(linhas_backlog)
+        finally:
+            if close_conn:
+                conn.close()
+
+    # Coleta meses ativos e arquivados para resumo
+    lista_lotes = listar_competencias_status(conn=conn if not close_conn else None)
+    meses_ativos = [l["mes_competencia"] for l in lista_lotes if not l["arquivado"]]
+    meses_arquivados = [l["mes_competencia"] for l in lista_lotes if l["arquivado"]]
+
+    msg = f"Planilha de trabalho atualizada com sucesso!\n"
+    msg += f"• Protocolos na planilha ativa: {linhas_geradas}\n"
+    msg += f"• Meses visíveis: {len(meses_ativos)} ({', '.join(meses_ativos) if meses_ativos else 'Nenhum'})\n"
+    msg += f"• Meses arquivados: {len(meses_arquivados)}"
+    if backup_path:
+        msg += f"\n• Cópia da planilha anterior guardada em: Planilhas anteriores/{backup_path.name}"
+    if csv_nome:
+        msg += f"\n• Novos pedidos do CSV '{csv_nome}' incorporados com sucesso."
+
+    return {
+        "status": "SUCESSO",
+        "backup_criado": str(backup_path) if backup_path else None,
+        "linhas_geradas": linhas_geradas,
+        "meses_ativos": meses_ativos,
+        "meses_arquivados": meses_arquivados,
+        "csv_processado": csv_nome,
+        "mensagem": msg,
+    }
+
+
+def listar_fiscais_cadastrados(conn: sqlite3.Connection | None = None) -> list[str]:
+    """Retorna lista alfabética e sem duplicatas de todos os fiscais registrados."""
+    close_conn = False
+    if conn is None:
+        conn = get_triagem_db()
+        close_conn = True
+
+    try:
+        initialize_schema_if_needed(conn, is_cep=False)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT DISTINCT UPPER(TRIM(fiscal)) as f
+            FROM historico_fiscais
+            WHERE fiscal IS NOT NULL AND TRIM(fiscal) != '' AND fiscal != 'Não Informado'
+            UNION
+            SELECT DISTINCT UPPER(TRIM(fiscal_atribuido)) as f
+            FROM vre_backlog
+            WHERE fiscal_atribuido IS NOT NULL AND TRIM(fiscal_atribuido) != '' AND fiscal_atribuido != 'Não Informado'
+            ORDER BY f ASC;
+            """
+        )
+        return [r["f"] for r in cur.fetchall() if r["f"]]
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def obter_ultimos_atendimentos(
+    limit: int = 50,
+    fiscal_filtro: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> list[dict[str, Any]]:
+    """Retorna os atendimentos mais recentes gravados no histórico e backlog."""
+    close_conn = False
+    if conn is None:
+        conn = get_triagem_db()
+        close_conn = True
+
+    try:
+        initialize_schema_if_needed(conn, is_cep=False)
+        cur = conn.cursor()
+        resultados: list[dict[str, Any]] = []
+
+        query = """
+            SELECT cnpj_limpo, fiscal, data_atendimento, origem_registro
+            FROM historico_fiscais
+            WHERE fiscal IS NOT NULL AND TRIM(fiscal) != '' AND fiscal != 'Não Informado'
+        """
+        params: list[Any] = []
+        if fiscal_filtro and fiscal_filtro.strip() and not fiscal_filtro.startswith("Todos"):
+            query += " AND UPPER(fiscal) = ?"
+            params.append(fiscal_filtro.strip().upper())
+
+        query += " ORDER BY data_atendimento DESC, id DESC LIMIT ?;"
+        params.append(limit)
+
+        cur.execute(query, tuple(params))
+        for r in cur.fetchall():
+            resultados.append(
+                {
+                    "cnpj_formatado": formatar_cnpj(r["cnpj_limpo"]),
+                    "cnpj_limpo": r["cnpj_limpo"],
+                    "fiscal": r["fiscal"],
+                    "data": r["data_atendimento"] or "-",
+                    "origem": r["origem_registro"] or "Histórico",
+                    "status": "Histórico Definitivo",
+                }
+            )
+
+        # Se ainda houver espaço no limit, busca também no backlog ativo
+        if len(resultados) < limit:
+            restante = limit - len(resultados)
+            q_back = """
+                SELECT cnpj_limpo, fiscal_atribuido, nome_empresarial, data_importacao, status
+                FROM vre_backlog
+                WHERE fiscal_atribuido IS NOT NULL AND TRIM(fiscal_atribuido) != '' AND fiscal_atribuido != 'Não Informado'
+            """
+            p_back: list[Any] = []
+            if fiscal_filtro and fiscal_filtro.strip() and not fiscal_filtro.startswith("Todos"):
+                q_back += " AND UPPER(fiscal_atribuido) = ?"
+                p_back.append(fiscal_filtro.strip().upper())
+            q_back += " ORDER BY data_importacao DESC LIMIT ?;"
+            p_back.append(restante)
+
+            cur.execute(q_back, tuple(p_back))
+            for r in cur.fetchall():
+                resultados.append(
+                    {
+                        "cnpj_formatado": formatar_cnpj(r["cnpj_limpo"]),
+                        "cnpj_limpo": r["cnpj_limpo"],
+                        "fiscal": r["fiscal_atribuido"],
+                        "data": r["data_importacao"] or "-",
+                        "origem": f"Backlog ({r['nome_empresarial'] or ''})".strip(),
+                        "status": r["status"],
+                    }
+                )
+
+        return resultados
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def buscar_historico_fiscais(
+    termo_busca: str = "",
+    fiscal_filtro: str | None = None,
+    limit: int = 100,
+    conn: sqlite3.Connection | None = None,
+) -> list[dict[str, Any]]:
+    """Busca fiscais históricos associados a um CNPJ, Razão Social ou filtrados por Fiscal."""
+    termo = str(termo_busca or "").strip()
+    fisc = str(fiscal_filtro or "").strip()
+    if fisc.startswith("Todos"):
+        fisc = ""
+
+    if not termo and not fisc:
+        return obter_ultimos_atendimentos(limit=limit, conn=conn)
+
+    if not termo and fisc:
+        return obter_ultimos_atendimentos(limit=limit, fiscal_filtro=fisc, conn=conn)
+
+    close_conn = False
+    if conn is None:
+        conn = get_triagem_db()
+        close_conn = True
+
+    try:
+        initialize_schema_if_needed(conn, is_cep=False)
+        cur = conn.cursor()
+
+        cnpj_limpo = normalizar_cnpj(termo)
+        resultados: list[dict[str, Any]] = []
+
+        if cnpj_limpo and len(cnpj_limpo) == 14:
+            # Busca exata por CNPJ em historico_fiscais
+            q_hist = """
+                SELECT cnpj_limpo, fiscal, data_atendimento, origem_registro
+                FROM historico_fiscais
+                WHERE cnpj_limpo = ?
+                  AND fiscal IS NOT NULL
+                  AND TRIM(fiscal) != ''
+                  AND fiscal != 'Não Informado'
+            """
+            p_hist: list[Any] = [cnpj_limpo]
+            if fisc:
+                q_hist += " AND UPPER(fiscal) = ?"
+                p_hist.append(fisc.upper())
+            q_hist += " ORDER BY data_atendimento DESC, id DESC LIMIT ?;"
+            p_hist.append(limit)
+
+            cur.execute(q_hist, tuple(p_hist))
+            for r in cur.fetchall():
+                resultados.append(
+                    {
+                        "cnpj_formatado": formatar_cnpj(r["cnpj_limpo"]),
+                        "cnpj_limpo": r["cnpj_limpo"],
+                        "fiscal": r["fiscal"],
+                        "data": r["data_atendimento"] or "-",
+                        "origem": r["origem_registro"] or "Histórico",
+                        "status": "Histórico Definitivo",
+                    }
+                )
+
+            # Também consulta se existe atendimento ou registro no backlog ativo
+            q_back = """
+                SELECT cnpj_limpo, fiscal_atribuido, nome_empresarial, data_importacao, status
+                FROM vre_backlog
+                WHERE cnpj_limpo = ?
+            """
+            p_back = [cnpj_limpo]
+            if fisc:
+                q_back += " AND UPPER(fiscal_atribuido) = ?"
+                p_back.append(fisc.upper())
+            q_back += " ORDER BY data_importacao DESC LIMIT ?;"
+            p_back.append(limit)
+
+            cur.execute(q_back, tuple(p_back))
+            for r in cur.fetchall():
+                fisc_text = (
+                    r["fiscal_atribuido"].strip()
+                    if (r["fiscal_atribuido"] and r["fiscal_atribuido"].strip())
+                    else "Não atribuído (Pendente)"
+                )
+                origem_text = f"Backlog ({r['nome_empresarial'] or ''})".strip()
+                resultados.append(
+                    {
+                        "cnpj_formatado": formatar_cnpj(r["cnpj_limpo"]),
+                        "cnpj_limpo": r["cnpj_limpo"],
+                        "fiscal": fisc_text,
+                        "data": r["data_importacao"] or "-",
+                        "origem": origem_text,
+                        "status": r["status"],
+                    }
+                )
+        else:
+            # Busca textual por nome ou termo (com escape seguro de wildcards LIKE)
+            termo_sanitizado = termo.replace("%", "\\%").replace("_", "\\_").upper()
+            busca_like = f"%{termo_sanitizado}%"
+
+            q_back = """
+                SELECT b.cnpj_limpo, b.fiscal_atribuido, b.nome_empresarial, b.data_importacao, b.status
+                FROM vre_backlog b
+                WHERE (UPPER(b.nome_empresarial) LIKE ? ESCAPE '\\'
+                   OR UPPER(COALESCE(b.fiscal_atribuido, '')) LIKE ? ESCAPE '\\')
+            """
+            p_back = [busca_like, busca_like]
+            if fisc:
+                q_back += " AND UPPER(b.fiscal_atribuido) = ?"
+                p_back.append(fisc.upper())
+            q_back += " LIMIT ?;"
+            p_back.append(limit)
+
+            cur.execute(q_back, tuple(p_back))
+            for r in cur.fetchall():
+                resultados.append(
+                    {
+                        "cnpj_formatado": formatar_cnpj(r["cnpj_limpo"]),
+                        "cnpj_limpo": r["cnpj_limpo"],
+                        "fiscal": r["fiscal_atribuido"] or "Não atribuído",
+                        "data": r["data_importacao"] or "-",
+                        "origem": f"Backlog: {r['nome_empresarial'] or ''}",
+                        "status": r["status"],
+                    }
+                )
+
+        return resultados
+    finally:
+        if close_conn:
+            conn.close()

@@ -1,0 +1,84 @@
+{
+  "fiscais": [
+    {
+      "cnpj_limpo": "33424347000110",
+      "fiscal": "Fiscal_Alfa",
+      "data_atendimento": "2025-06-12",
+      "origem_registro": "Demonstrativo_Inicial"
+    },
+    {
+      "cnpj_limpo": "42454244000194",
+      "fiscal": "Fiscal_Beta",
+      "data_atendimento": "2025-06-18",
+      "origem_registro": "Demonstrativo_Inicial"
+    },
+    {
+      "cnpj_limpo": "61017032000194",
+      "fiscal": "Fiscal_Gama",
+      "data_atendimento": "2025-07-01",
+      "origem_registro": "Demonstrativo_Inicial"
+    },
+    {
+      "cnpj_limpo": "33333333000133",
+      "fiscal": "Fiscal_Delta",
+      "data_atendimento": "2025-07-15",
+      "origem_registro": "Demonstrativo_Inicial"
+    }
+  ],
+  "ceps": [
+    {
+      "cep_limpo": "15015300",
+      "area": "CENTRAL",
+      "bairro": "CENTRO",
+      "origem": "DEMONSTRATIVO"
+    },
+    {
+      "cep_limpo": "15015000",
+      "area": "CENTRAL",
+      "bairro": "CENTRO",
+      "origem": "DEMONSTRATIVO"
+    },
+    {
+      "cep_limpo": "15015750",
+      "area": "CENTRAL",
+      "bairro": "VILA REDENTORA",
+      "origem": "DEMONSTRATIVO"
+    },
+    {
+      "cep_limpo": "15025000",
+      "area": "BOSQUE",
+      "bairro": "BOA VISTA",
+      "origem": "DEMONSTRATIVO"
+    },
+    {
+      "cep_limpo": "15050090",
+      "area": "HB",
+      "bairro": "VILA ANCHIETA",
+      "origem": "DEMONSTRATIVO"
+    },
+    {
+      "cep_limpo": "15055000",
+      "area": "HB",
+      "bairro": "JARDIM AMERICA",
+      "origem": "DEMONSTRATIVO"
+    },
+    {
+      "cep_limpo": "15080000",
+      "area": "BOSQUE",
+      "bairro": "DISTRITO INDUSTRIAL",
+      "origem": "DEMONSTRATIVO"
+    },
+    {
+      "cep_limpo": "15090500",
+      "area": "HB",
+      "bairro": "JARDIM REDENTORA",
+      "origem": "DEMONSTRATIVO"
+    },
+    {
+      "cep_limpo": "15042015",
+      "area": "CIDADE DA CRIANÇA",
+      "bairro": "CENTRO",
+      "origem": "DEMONSTRATIVO"
+    }
+  ]
+}

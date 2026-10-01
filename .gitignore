@@ -1,0 +1,120 @@
+# ==============================================================================
+# .gitignore - Sistema de Triagem VRE (SMAURB / Inspetoria Fiscal)
+# ==============================================================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller / Build artifacts
+fbuild/
+*.manifest
+*.spec
+
+# Cache e pacotes embutidos
+.cache*/
+*.zip
+*.tar.gz
+*.whl
+
+# Virtual Environments
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Jupyter / IPython
+.ipynb_checkpoints
+
+# Logs e diagnósticos
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+triagem_erro.log
+
+# Bancos de dados SQLite locais (gerados via init_db.py)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+!database/dados_referencia/
+
+# Planilhas ativas e backups com dados operacionais
+Planilha_Controle_VRE_Ativa*.xlsx
+planilhas_anteriores/*.xlsx
+planilhas_anteriores/*.xls
+planilhas_trabalho/
+~$*.xlsx
+~$*.xls
+*.tmp.xlsx
+
+# Arquivos CSV operacionais locais
+entrada_csv/*.csv
+entrada_csv/processados/*.csv
+*.csv
+!tests/test_data/*.csv
+
+# IDEs e Editores
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.obsidian/
+
+# Arquivos de Sistema Operacional
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+[Dd]esktop.ini
