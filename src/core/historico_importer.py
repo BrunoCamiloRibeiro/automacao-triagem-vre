@@ -242,6 +242,10 @@ def _mapear_colunas_aba(ws) -> tuple[int, dict[str, int]]:
                 mapa["protocolo_existente"] = idx
             elif ("PROTOCOLOSIGM" in val or "SIGM" in val) and "protocolo_sigm" not in mapa:
                 mapa["protocolo_sigm"] = idx
+            elif ("RESTRIÇÃO" == val or "RESTRICAO" == val) and "restricao" not in mapa:
+                mapa["restricao"] = idx
+            elif ("ENDEREÇO" == val or "ENDERECO" == val) and "endereco" not in mapa:
+                mapa["endereco"] = idx
             elif "DATA" in val:
                 if "DATA VRE" in val or "DATA DO VRE" in val:
                     mapa["data_sec"] = idx
@@ -372,6 +376,8 @@ def importar_planilha_historico(
         idx_nome = col_map.get("nome_empresarial")
         idx_status = col_map.get("status")
         idx_tipo_servico = col_map.get("tipo_servico")
+        idx_restricao = col_map.get("restricao")
+        idx_endereco = col_map.get("endereco")
         idx_cnaes = col_map.get("cnaes")
         idx_cnaes_nao = col_map.get("cnaes_nao")
         idx_insc = col_map.get("inscricao_municipal")
@@ -491,23 +497,44 @@ def importar_planilha_historico(
 
             cnaes_val = str(row[idx_cnaes - 1]).strip() if idx_cnaes and idx_cnaes <= len(row) and row[idx_cnaes - 1] else ""
             tipo_servico_val = str(row[idx_tipo_servico - 1]).strip() if idx_tipo_servico and idx_tipo_servico <= len(row) and row[idx_tipo_servico - 1] else ""
+            restricao_val = str(row[idx_restricao - 1]).strip() if idx_restricao and idx_restricao <= len(row) and row[idx_restricao - 1] else ""
 
-            status_raw = str(row[idx_status - 1]).strip().upper() if idx_status and idx_status <= len(row) and row[idx_status - 1] else ""
-            if status_raw in ["DEFERIDO", "INDEFERIDO", "CANCELADO", "CASSADO"]:
+            status_raw_orig = str(row[idx_status - 1]).strip() if idx_status and idx_status <= len(row) and row[idx_status - 1] else ""
+            status_raw = status_raw_orig.upper()
+            STATUS_CANONICOS = {
+                "DEFERIDO": "Deferido",
+                "INDEFERIDO": "Indeferido",
+                "CANCELADO": "Cancelado",
+                "CASSADO": "Cassado",
+                "EM ANDAMENTO": "Em Andamento",
+            }
+            if status_raw in STATUS_CANONICOS:
+                status_calc = STATUS_CANONICOS[status_raw]
+                status_extra = STATUS_CANONICOS[status_raw]
+            elif status_raw in ["FINALIZADO"]:
                 status_calc = "FINALIZADO"
-            elif status_raw in ["EM ANDAMENTO", "DISTRIBUIDO", "DISTRIBUÍDO"]:
+                status_extra = ""
+            elif status_raw in ["DISTRIBUIDO", "DISTRIBUÍDO"]:
                 status_calc = "DISTRIBUIDO"
-            elif fiscal_str:
-                status_calc = "DISTRIBUIDO"
+                status_extra = ""
+            elif status_raw in ["PENDENTE", "NÃO DISTRIBUÍDO", "NAO DISTRIBUIDO", "NÃO DISTRIBUIDO", "NAO DISTRIBUÍDO", "", "NONE", "NULL"]:
+                status_calc = "DISTRIBUIDO" if fiscal_str else "PENDENTE"
+                status_extra = ""
             else:
-                status_calc = "PENDENTE"
+                status_calc = status_raw_orig
+                status_extra = status_raw_orig
 
-            tipo_servico_upper = tipo_servico_val.upper()
-            flag_noturno = 1 if "NOTURNO" in tipo_servico_upper else 0
-            flag_restricao = 1 if ("RESTRIÇÃO" in tipo_servico_upper or "RESTRICAO" in tipo_servico_upper) else 0
+            comb_classificacao = f"{tipo_servico_val} {restricao_val}".upper()
+            flag_noturno = 1 if "NOTURNO" in comb_classificacao else 0
+            flag_restricao = 1 if (("RESTRIÇÃO" in comb_classificacao or "RESTRICAO" in comb_classificacao) and "SEM RESTRI" not in comb_classificacao) else 0
 
-            extras = {
-                "IPTU": str(row[idx_iptu - 1]).strip() if idx_iptu and idx_iptu <= len(row) and row[idx_iptu - 1] is not None else "",
+            iptu_str = str(row[idx_iptu - 1]).strip() if idx_iptu and idx_iptu <= len(row) and row[idx_iptu - 1] is not None else ""
+            if iptu_str.endswith(".0") and iptu_str[:-2].isdigit():
+                iptu_str = iptu_str[:-2]
+
+            extras: dict[str, Any] = {
+                "Iptu": iptu_str,
+                "IPTU": iptu_str,
                 "GrauRiscoGeral": str(row[idx_grau_risco - 1]).strip() if idx_grau_risco and idx_grau_risco <= len(row) and row[idx_grau_risco - 1] else "",
                 "SituacaoPostura": str(row[idx_postura - 1]).strip() if idx_postura and idx_postura <= len(row) and row[idx_postura - 1] else "",
                 "InscricaoMunicipal": str(row[idx_insc - 1]).strip() if idx_insc and idx_insc <= len(row) and row[idx_insc - 1] else "",
@@ -526,6 +553,10 @@ def importar_planilha_historico(
                 "ProtocoloSigm": str(row[idx_prot_sigm - 1]).strip() if idx_prot_sigm and idx_prot_sigm <= len(row) and row[idx_prot_sigm - 1] else "",
                 "Data": data_normalizada,
             }
+            if status_extra:
+                extras["Status"] = status_extra
+            if restricao_val and restricao_val.upper() not in ("NONE", "NULL"):
+                extras["RestricaoCustom"] = restricao_val
 
             protocolos_consolidados[licenca_val] = {
                 "protocolo_licenca": licenca_val,
@@ -618,17 +649,31 @@ def importar_planilha_historico(
                     data_importacao = excluded.data_importacao,
                     mes_competencia = excluded.mes_competencia,
                     fiscal_atribuido = CASE
-                        WHEN vre_backlog.fiscal_atribuido IS NULL OR TRIM(vre_backlog.fiscal_atribuido) = ''
+                        WHEN excluded.fiscal_atribuido IS NOT NULL AND TRIM(excluded.fiscal_atribuido) != ''
                         THEN excluded.fiscal_atribuido
                         ELSE vre_backlog.fiscal_atribuido
                     END,
                     area = CASE
-                        WHEN vre_backlog.area IS NULL OR TRIM(vre_backlog.area) = ''
+                        WHEN excluded.area IS NOT NULL AND TRIM(excluded.area) != ''
                         THEN excluded.area
                         ELSE vre_backlog.area
                     END,
+                    tipo_servico = CASE
+                        WHEN excluded.tipo_servico IS NOT NULL AND TRIM(excluded.tipo_servico) != ''
+                        THEN excluded.tipo_servico
+                        ELSE vre_backlog.tipo_servico
+                    END,
+                    flag_restricao = CASE
+                        WHEN excluded.flag_restricao = 1 THEN 1
+                        ELSE vre_backlog.flag_restricao
+                    END,
+                    flag_noturno = CASE
+                        WHEN excluded.flag_noturno = 1 THEN 1
+                        ELSE vre_backlog.flag_noturno
+                    END,
                     status = CASE
-                        WHEN excluded.status = 'FINALIZADO' THEN 'FINALIZADO'
+                        WHEN excluded.status IS NOT NULL AND TRIM(excluded.status) != '' AND excluded.status != 'PENDENTE'
+                        THEN excluded.status
                         ELSE vre_backlog.status
                     END,
                     dados_extras_json = COALESCE(excluded.dados_extras_json, vre_backlog.dados_extras_json);
@@ -731,6 +776,9 @@ def escanear_e_importar_planilhas_antigas(
             "meses": [],
             "detalhes": [],
         }
+
+    # Ordena do mais antigo para o mais recente para que edições recentes prevaleçam no UPSERT
+    arquivos_candidatos.sort(key=lambda f: f.stat().st_mtime if f.exists() else 0)
 
     linhas_totais = 0
     total_duplicatas = 0

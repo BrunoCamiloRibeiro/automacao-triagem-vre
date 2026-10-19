@@ -46,7 +46,11 @@ from src.core.database import (
     get_triagem_db,
     initialize_schema_if_needed,
 )
-from src.core.excel_writer import gerar_planilha_trabalho
+from src.core.excel_writer import (
+    gerar_planilha_trabalho,
+    registrar_hash_planilha_gerada,
+    sincronizar_planilha_ativa_com_banco,
+)
 from src.core.normalizer import (
     extrair_cnaes,
     formatar_cnpj,
@@ -199,6 +203,15 @@ def processar_fluxo_seco(
 
     conn_cep = get_cep_db(cep_db_path)
     initialize_schema_if_needed(conn_cep, is_cep=True)
+
+    saida_final = Path(saida_xlsx) if saida_xlsx else OUTPUT_XLSX_PATH
+
+    # 0. Sincroniza edições manuais feitas pelo usuário na planilha ativa existente ANTES de importar novo CSV
+    sincronizar_planilha_ativa_com_banco(
+        caminho_xlsx=saida_final,
+        triagem_conn=conn_triagem,
+        cep_conn=conn_cep,
+    )
 
     total_importados = 0
 
@@ -369,7 +382,7 @@ def processar_fluxo_seco(
     # 5. Reconciliação automática: resolve Área para protocolos pendentes cujos CEPs ou Bairros foram mapeados
     reconciliar_areas_backlog(triagem_conn=conn_triagem, cep_conn=conn_cep)
 
-    # 6. Recuperação de todos os protocolos em aberto nos meses ativos (não arquivados)
+    # 6. Recuperação de todos os protocolos dos meses ativos (não arquivados)
     cur_triagem = conn_triagem.cursor()
     cur_triagem.execute(
         """
@@ -389,17 +402,15 @@ def processar_fluxo_seco(
             flag_restricao, flag_noturno, tipo_servico, status,
             data_finalizacao, dados_extras_json
         FROM vre_backlog
-        WHERE status IN ('PENDENTE', 'DISTRIBUIDO')
-          AND mes_competencia NOT IN (
-              SELECT mes_competencia FROM controle_competencias WHERE arquivado = 1
-          )
+        WHERE mes_competencia NOT IN (
+            SELECT mes_competencia FROM controle_competencias WHERE arquivado = 1
+        )
         ORDER BY mes_competencia ASC, data_importacao ASC, protocolo_sil ASC;
         """
     )
     linhas_backlog = [dict(r) for r in cur_triagem.fetchall()]
 
     # 7. Backup preventivo da planilha ativa anterior para /Planilhas anteriores
-    saida_final = Path(saida_xlsx) if saida_xlsx else OUTPUT_XLSX_PATH
     if saida_final.exists() and saida_final.stat().st_size > 0:
         if "tests" not in saida_final.parts and "test_data" not in saida_final.parts:
             try:
@@ -411,12 +422,13 @@ def processar_fluxo_seco(
             except Exception:
                 pass
 
-    # 8. Geração da planilha de trabalho ativa
+    # 8. Geração da planilha de trabalho ativa e registro do hash oficial no banco
     gerar_planilha_trabalho(
         registros_backlog=linhas_backlog,
         caminho_saida=saida_final,
         caminho_template=template_path,
     )
+    registrar_hash_planilha_gerada(saida_final, conn_triagem)
 
     # Move para processados apenas em produção (nunca move arquivos de teste)
     if arquivo_csv is not None and arquivo_csv.exists():

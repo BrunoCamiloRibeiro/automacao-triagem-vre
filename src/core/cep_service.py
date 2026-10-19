@@ -122,7 +122,7 @@ def registrar_area_cep(
             # Remove da fila de pendentes se existir
             cur.execute("DELETE FROM cep_pendentes WHERE cep_limpo = ?;", (cep_limpo,))
 
-        # Atualiza protocolos pendentes no backlog central que tenham esse CEP
+        # Tenta atualizar protocolos pendentes no backlog central que tenham esse CEP
         try:
             backfill_area_backlog_por_cep(
                 cep_limpo,
@@ -468,6 +468,8 @@ def reconciliar_areas_backlog(
         if extras_raw:
             try:
                 ex = json.loads(extras_raw)
+                if ex.get("AreaLimpaManualmente"):
+                    continue
                 cep = ex.get("Cep", "")
                 logr = ex.get("Logradouro", "")
             except Exception:
@@ -491,3 +493,4 @@ def reconciliar_areas_backlog(
             )
 
     return len(atualizados)
+

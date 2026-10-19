@@ -12,8 +12,10 @@ Gera o arquivo oficial `Planilha_Controle_VRE_Ativa.xlsx` reproduzindo fielmente
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import shutil
+import sqlite3
 from copy import copy
 from pathlib import Path
 from typing import Any, Sequence
@@ -24,6 +26,7 @@ from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+from src.core.cep_service import harmonizar_nome_area, registrar_area_cep
 from src.core.config import (
     BASE_DIR,
     COR_CABECALHO,
@@ -41,7 +44,16 @@ from src.core.config import (
     ensure_directories,
     resolve_template_path,
 )
-from src.core.normalizer import montar_endereco_completo
+from src.core.database import db_transaction, get_cep_db, get_triagem_db, initialize_schema_if_needed
+from src.core.normalizer import (
+    formatar_cnpj,
+    montar_endereco_completo,
+    normalizar_cep,
+    normalizar_cnpj,
+)
+
+# Cache em memória do último hash gerado pelo sistema para cada caminho de planilha
+_ULTIMO_HASH_GERADO: dict[str, str] = {}
 
 # Definição oficial das 32 colunas da planilha de trabalho ativa (31 originais + nova coluna única de Restrição)
 COLUNAS_CABECALHO = [
@@ -97,6 +109,513 @@ REGRAS_CONDICIONAIS_ORDEM = [
     ('$D3="Com Restrição Livre"', COR_RESTRICAO_LIVRE),
     ('$E3="Com Restrição"', COR_RESTRICAO_LIVRE),
 ]
+
+
+def _calcular_hash_xlsx(caminho: Path) -> str:
+    """Calcula o hash SHA-256 de um arquivo Excel em disco."""
+    if not caminho.exists() or not caminho.is_file():
+        return ""
+    hasher = hashlib.sha256()
+    try:
+        with open(caminho, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except Exception:
+        return ""
+
+
+def registrar_hash_planilha_gerada(
+    caminho_xlsx: Path | str,
+    triagem_conn: sqlite3.Connection | None = None,
+) -> str:
+    """Registra o hash SHA-256 da planilha recém-gerada pelo sistema."""
+    p = Path(caminho_xlsx).resolve()
+    h = _calcular_hash_xlsx(p)
+    if not h:
+        return ""
+    chave = str(p)
+    _ULTIMO_HASH_GERADO[chave] = h
+
+    if triagem_conn is not None:
+        try:
+            with db_transaction(triagem_conn) as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS controle_planilha_ativa (
+                        caminho TEXT PRIMARY KEY,
+                        hash_gerado TEXT,
+                        atualizado_em DATETIME DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO controle_planilha_ativa (caminho, hash_gerado, atualizado_em)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(caminho) DO UPDATE SET
+                        hash_gerado = excluded.hash_gerado,
+                        atualizado_em = CURRENT_TIMESTAMP;
+                    """,
+                    (chave, h),
+                )
+        except Exception:
+            pass
+    return h
+
+
+def _obter_hash_planilha_registrado(
+    caminho_xlsx: Path,
+    triagem_conn: sqlite3.Connection | None = None,
+) -> str:
+    """Recupera o último hash SHA-256 gerado pelo sistema para a planilha ativa."""
+    chave = str(caminho_xlsx.resolve())
+    if triagem_conn is not None:
+        try:
+            cur = triagem_conn.cursor()
+            cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='controle_planilha_ativa';"
+            )
+            if cur.fetchone():
+                cur.execute(
+                    "SELECT hash_gerado FROM controle_planilha_ativa WHERE caminho = ? LIMIT 1;",
+                    (chave,),
+                )
+                row = cur.fetchone()
+                if row and row["hash_gerado"]:
+                    return str(row["hash_gerado"])
+        except Exception:
+            pass
+    return _ULTIMO_HASH_GERADO.get(chave, "")
+
+
+def _limpar_valor_celula(val: Any) -> str:
+    """Converte valor de célula do Excel em string limpa, preservando inteiros e datas."""
+    if val is None:
+        return ""
+    if isinstance(val, bool):
+        return str(val)
+    if isinstance(val, int):
+        return str(val)
+    if isinstance(val, float):
+        if val.is_integer():
+            return str(int(val))
+        return str(val).strip()
+    if isinstance(val, (datetime.date, datetime.datetime)):
+        return val.strftime("%Y-%m-%d")
+    s = str(val).strip()
+    if s.upper() in ("NONE", "NULL", "#N/A", "#REF!"):
+        return ""
+    if s.endswith(".0") and s[:-2].isdigit():
+        return s[:-2]
+    return s
+
+
+def sincronizar_planilha_ativa_com_banco(
+    caminho_xlsx: Path | str | None = None,
+    triagem_conn: sqlite3.Connection | None = None,
+    cep_conn: sqlite3.Connection | None = None,
+    forcar: bool = False,
+) -> int:
+    """Lê a Planilha_Controle_VRE_Ativa.xlsx existente e sincroniza todas as edições manuais
+    feitas pelo operador de volta para o banco SQLite (vre_backlog, historico_fiscais e cep_areas.db)
+    antes que novos CSVs sejam processados ou a planilha seja regenerada.
+    """
+    alvo = Path(caminho_xlsx) if caminho_xlsx else OUTPUT_XLSX_PATH
+    if not alvo.exists() or not alvo.is_file() or alvo.stat().st_size == 0:
+        return 0
+
+    close_triagem = False
+    if triagem_conn is None:
+        triagem_conn = get_triagem_db()
+        initialize_schema_if_needed(triagem_conn, is_cep=False)
+        close_triagem = True
+
+    close_cep = False
+    if cep_conn is None:
+        try:
+            cep_conn = get_cep_db()
+            initialize_schema_if_needed(cep_conn, is_cep=True)
+            close_cep = True
+        except Exception:
+            cep_conn = None
+
+    try:
+        hash_atual = _calcular_hash_xlsx(alvo)
+        hash_registrado = _obter_hash_planilha_registrado(alvo, triagem_conn)
+
+        # Se a planilha em disco tem exatamente o mesmo hash de quando foi gerada pelo sistema,
+        # não houve nenhuma edição no Excel a sincronizar.
+        if not forcar and hash_atual and hash_registrado and hash_atual == hash_registrado:
+            return 0
+
+        try:
+            wb = openpyxl.load_workbook(str(alvo), data_only=True, read_only=True)
+        except Exception:
+            return 0
+
+        ws = wb["Controle VRE"] if "Controle VRE" in wb.sheetnames else wb.active
+        linhas_planilha = list(ws.iter_rows(values_only=True))
+        wb.close()
+
+        # Precisa ter pelo menos cabeçalho na linha 2 e 1 linha de dados (linha 3+)
+        if len(linhas_planilha) < 3:
+            return 0
+
+        cabecalho_l2 = [str(c or "").strip().upper() for c in linhas_planilha[1]]
+        # Verifica se é de fato uma planilha com cabeçalho de controle VRE
+        if not any(k in cabecalho_l2 for k in ("STATUS", "FISCAL", "PROTOCOLOLICENCA", "CNPJ")):
+            return 0
+
+        cur = triagem_conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                protocolo_licenca, protocolo_sil, cnpj_limpo, cnpj_formatado,
+                nome_empresarial, mes_competencia, data_importacao,
+                bairro_original, area, cnaes_licenciadas, fiscal_atribuido,
+                flag_restricao, flag_noturno, tipo_servico, status,
+                dados_extras_json
+            FROM vre_backlog;
+            """
+        )
+        existentes_por_licenca: dict[str, dict[str, Any]] = {}
+        existentes_por_sil: dict[str, dict[str, Any]] = {}
+        for r in cur.fetchall():
+            d = dict(r)
+            lic = str(d.get("protocolo_licenca") or "").strip()
+            sil = str(d.get("protocolo_sil") or "").strip()
+            if lic:
+                existentes_por_licenca[lic] = d
+            if sil and sil not in existentes_por_sil:
+                existentes_por_sil[sil] = d
+
+        atualizacoes_backlog: list[tuple[Any, ...]] = []
+        insercoes_backlog: list[tuple[Any, ...]] = []
+        fiscais_para_historico: list[tuple[str, str, str, str]] = []
+        ceps_para_mapear: list[tuple[str, str, str]] = []
+        meses_ativos_detectados: set[str] = set()
+
+        data_hoje = datetime.date.today().isoformat()
+
+        for idx_linha, row in enumerate(linhas_planilha[2:], start=3):
+            if not row or not any(row):
+                continue
+
+            def _col(pos_1based: int) -> str:
+                if pos_1based <= len(row):
+                    return _limpar_valor_celula(row[pos_1based - 1])
+                return ""
+
+            status_excel = _col(2)
+            fiscal_excel = _col(3)
+            tipo_servico_excel = _col(4)
+            restricao_excel = _col(5)
+            data_col6 = _col(6)
+            iptu_col7 = _col(7)
+            area_excel = _col(8)
+            endereco_excel = _col(9)
+            prot_existente_excel = _col(10)
+            prot_sigm_excel = _col(11)
+            prot_sil_excel = _col(12)
+            prot_licenca_excel = _col(13)
+            data_col14 = _col(14)
+            grau_risco_excel = _col(15)
+            situacao_postura_excel = _col(16)
+            insc_mun_excel = _col(17)
+            cnpj_excel = _col(18)
+            nome_emp_excel = _col(19)
+            telefone_excel = _col(20)
+            email_excel = _col(21)
+            tipo_end_excel = _col(22)
+            logradouro_excel = _col(23)
+            numero_excel = _col(24)
+            complemento_excel = _col(25)
+            bairro_excel = _col(26)
+            cep_excel = _col(27)
+            finalidade_excel = _col(28)
+            cnaes_lic_excel = _col(29)
+            cnaes_nao_lic_excel = _col(30)
+            iptu_col31 = _col(31)
+
+            # Ignora linhas sem nenhuma chave de identificação
+            if not prot_licenca_excel and not prot_sil_excel and not cnpj_excel and not nome_emp_excel:
+                continue
+
+            reg_ant = None
+            if prot_licenca_excel and prot_licenca_excel in existentes_por_licenca:
+                reg_ant = existentes_por_licenca[prot_licenca_excel]
+            elif prot_sil_excel and prot_sil_excel in existentes_por_sil:
+                reg_ant = existentes_por_sil[prot_sil_excel]
+
+            extras: dict[str, Any] = {}
+            if reg_ant and reg_ant.get("dados_extras_json"):
+                try:
+                    extras = json.loads(reg_ant["dados_extras_json"])
+                except Exception:
+                    extras = {}
+
+            prot_licenca_final = (
+                reg_ant["protocolo_licenca"]
+                if reg_ant
+                else (prot_licenca_excel or f"MANUAL_{normalizar_cnpj(cnpj_excel) or idx_linha}_{data_hoje}")
+            )
+            prot_sil_final = prot_sil_excel or (reg_ant.get("protocolo_sil") if reg_ant else "") or ""
+
+            cnpj_limpo = normalizar_cnpj(cnpj_excel) or (reg_ant.get("cnpj_limpo") if reg_ant else "") or ""
+            cnpj_fmt = formatar_cnpj(cnpj_limpo) if len(cnpj_limpo) == 14 else (cnpj_excel or (reg_ant.get("cnpj_formatado") if reg_ant else "") or "")
+            nome_emp_final = nome_emp_excel or (reg_ant.get("nome_empresarial") if reg_ant else "") or ""
+
+            # Preserva competência e data_importacao do registro existente
+            data_vre_final = data_col14 or extras.get("Data") or (reg_ant.get("data_importacao") if reg_ant else "") or data_col6 or data_hoje
+            if reg_ant and reg_ant.get("mes_competencia"):
+                mes_comp_final = reg_ant["mes_competencia"]
+                data_imp_final = reg_ant.get("data_importacao") or data_vre_final
+            else:
+                # Extrai AAAA-MM
+                if "/" in data_vre_final and len(data_vre_final.split("/")) == 3:
+                    p_d = data_vre_final.split("/")
+                    mes_comp_final = f"{p_d[2][:4]}-{p_d[1].zfill(2)}"
+                    data_imp_final = f"{p_d[2][:4]}-{p_d[1].zfill(2)}-{p_d[0].zfill(2)}"
+                elif "-" in data_vre_final and len(data_vre_final) >= 7:
+                    mes_comp_final = data_vre_final[:7]
+                    data_imp_final = data_vre_final[:10]
+                else:
+                    mes_comp_final = data_hoje[:7]
+                    data_imp_final = data_hoje
+            meses_ativos_detectados.add(mes_comp_final)
+
+            # Status: se o usuário preencheu algo em Status (ex: 'Em Andamento', 'Deferido', 'Indeferido', etc.), preserva integralmente
+            status_upper = status_excel.upper()
+            if not status_excel or status_upper in (
+                "PENDENTE",
+                "DISTRIBUIDO",
+                "DISTRIBUÍDO",
+                "NÃO DISTRIBUÍDO",
+                "NAO DISTRIBUIDO",
+                "NÃO DISTRIBUIDO",
+                "NAO DISTRIBUÍDO",
+            ):
+                status_db = "DISTRIBUIDO" if fiscal_excel else "PENDENTE"
+                extras["Status"] = ""
+            else:
+                status_db = status_excel
+                extras["Status"] = status_excel
+
+            # Flags e Restrição
+            flag_r = int(reg_ant.get("flag_restricao") or 0) if reg_ant else 0
+            flag_n = int(reg_ant.get("flag_noturno") or 0) if reg_ant else 0
+            if restricao_excel:
+                r_up = restricao_excel.upper()
+                if "NOTURNO" in r_up:
+                    flag_n = 1
+                elif "RESTRI" in r_up and "SEM" not in r_up:
+                    flag_r = 1
+                    flag_n = 0
+                elif "SEM" in r_up:
+                    flag_r = 0
+                    flag_n = 0
+                extras["RestricaoCustom"] = restricao_excel
+            else:
+                extras.pop("RestricaoCustom", None)
+
+            # Tipo de Serviço
+            tipo_servico_final = tipo_servico_excel
+            if tipo_servico_excel:
+                extras["TipoServicoCustom"] = tipo_servico_excel
+            else:
+                extras.pop("TipoServicoCustom", None)
+
+            # IPTU (prioriza edição na Coluna 7 ou Coluna 31)
+            iptu_ant = str(extras.get("Iptu") or extras.get("IPTU") or "")
+            if iptu_col7 != iptu_ant:
+                iptu_final = iptu_col7
+            elif iptu_col31 != iptu_ant:
+                iptu_final = iptu_col31
+            else:
+                iptu_final = iptu_col7 or iptu_col31
+            extras["Iptu"] = iptu_final
+            extras["IPTU"] = iptu_final
+
+            # Área
+            area_ant = str(reg_ant.get("area") or "").strip() if reg_ant else ""
+            area_final = harmonizar_nome_area(area_excel) if area_excel else ""
+            if area_ant and not area_final:
+                extras["AreaLimpaManualmente"] = True
+            elif area_final:
+                extras["AreaLimpaManualmente"] = False
+
+            # Campos extras e de endereço
+            bairro_final = bairro_excel or (reg_ant.get("bairro_original") if reg_ant else "") or ""
+            cnaes_lic_final = cnaes_lic_excel or (reg_ant.get("cnaes_licenciadas") if reg_ant else "") or ""
+
+            extras["Data"] = data_vre_final
+            if data_col6 and data_col6 != data_vre_final:
+                extras["DataCol6"] = data_col6
+            else:
+                extras.pop("DataCol6", None)
+
+            extras["ProtocoloExistente"] = prot_existente_excel
+            extras["ProtocoloSigm"] = prot_sigm_excel
+            extras["ProtocoloSigm / OS"] = prot_sigm_excel
+            extras["GrauRiscoGeral"] = grau_risco_excel
+            extras["SituacaoPostura"] = situacao_postura_excel
+            extras["InscricaoMunicipal"] = insc_mun_excel
+            extras["Telefone"] = telefone_excel
+            extras["E-mail"] = email_excel
+            extras["TipoEndereco"] = tipo_end_excel
+            extras["Logradouro"] = logradouro_excel
+            extras["Numero"] = numero_excel
+            extras["Complemento"] = complemento_excel
+            extras["Bairro"] = bairro_final
+            extras["Cep"] = cep_excel
+            extras["FinalidadeEndereco"] = finalidade_excel
+            extras["CnaesLicenciadas"] = cnaes_lic_final
+            extras["CnaesNaoLicenciadas"] = cnaes_nao_lic_excel
+
+            end_recalculado = montar_endereco_completo(
+                tipo_end_excel,
+                logradouro_excel,
+                numero_excel,
+                complemento_excel,
+                bairro_final,
+            )
+            if endereco_excel and endereco_excel != end_recalculado:
+                extras["EnderecoCustom"] = endereco_excel
+            else:
+                extras.pop("EnderecoCustom", None)
+
+            extras_json = json.dumps(extras, ensure_ascii=False)
+
+            if reg_ant:
+                atualizacoes_backlog.append(
+                    (
+                        prot_sil_final,
+                        cnpj_limpo,
+                        cnpj_fmt,
+                        nome_emp_final,
+                        bairro_final,
+                        area_final,
+                        cnaes_lic_final,
+                        fiscal_excel,
+                        flag_r,
+                        flag_n,
+                        tipo_servico_final,
+                        status_db,
+                        extras_json,
+                        prot_licenca_final,
+                    )
+                )
+            else:
+                insercoes_backlog.append(
+                    (
+                        prot_licenca_final,
+                        prot_sil_final,
+                        cnpj_limpo,
+                        cnpj_fmt,
+                        nome_emp_final,
+                        mes_comp_final,
+                        data_imp_final,
+                        bairro_final,
+                        area_final,
+                        cnaes_lic_final,
+                        fiscal_excel,
+                        flag_r,
+                        flag_n,
+                        tipo_servico_final,
+                        status_db,
+                        extras_json,
+                    )
+                )
+
+            # Aprendizado automático de Fiscal e CEP x Área editados na planilha ativa
+            if fiscal_excel and fiscal_excel.upper() not in ("NÃO INFORMADO", "NAO INFORMADO", "PENDENTE") and len(cnpj_limpo) == 14:
+                fiscais_para_historico.append((cnpj_limpo, fiscal_excel, data_imp_final, "Planilha_Ativa"))
+
+            cep_limpo = normalizar_cep(cep_excel)
+            if area_final and len(cep_limpo) == 8:
+                ceps_para_mapear.append((cep_limpo, area_final, bairro_final))
+
+        if atualizacoes_backlog or insercoes_backlog:
+            with db_transaction(triagem_conn) as t_cur:
+                if atualizacoes_backlog:
+                    t_cur.executemany(
+                        """
+                        UPDATE vre_backlog
+                        SET protocolo_sil = ?,
+                            cnpj_limpo = ?,
+                            cnpj_formatado = ?,
+                            nome_empresarial = ?,
+                            bairro_original = ?,
+                            area = ?,
+                            cnaes_licenciadas = ?,
+                            fiscal_atribuido = ?,
+                            flag_restricao = ?,
+                            flag_noturno = ?,
+                            tipo_servico = ?,
+                            status = ?,
+                            dados_extras_json = ?
+                        WHERE protocolo_licenca = ?;
+                        """,
+                        atualizacoes_backlog,
+                    )
+                if insercoes_backlog:
+                    t_cur.executemany(
+                        """
+                        INSERT OR IGNORE INTO vre_backlog (
+                            protocolo_licenca, protocolo_sil, cnpj_limpo, cnpj_formatado,
+                            nome_empresarial, mes_competencia, data_importacao,
+                            bairro_original, area, cnaes_licenciadas, fiscal_atribuido,
+                            flag_restricao, flag_noturno, tipo_servico, status, dados_extras_json
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        """,
+                        insercoes_backlog,
+                    )
+                if fiscais_para_historico:
+                    t_cur.executemany(
+                        """
+                        INSERT INTO historico_fiscais (cnpj_limpo, fiscal, data_atendimento, origem_registro)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(cnpj_limpo, fiscal) DO UPDATE SET
+                            data_atendimento = CASE
+                                WHEN excluded.data_atendimento > historico_fiscais.data_atendimento
+                                THEN excluded.data_atendimento
+                                ELSE historico_fiscais.data_atendimento
+                            END;
+                        """,
+                        fiscais_para_historico,
+                    )
+                for m in meses_ativos_detectados:
+                    if m and len(m) == 7:
+                        t_cur.execute(
+                            """
+                            INSERT OR IGNORE INTO controle_competencias (mes_competencia, arquivado)
+                            VALUES (?, 0);
+                            """,
+                            (m,),
+                        )
+
+        if cep_conn is not None and ceps_para_mapear:
+            for cep_l, area_f, bairro_f in ceps_para_mapear:
+                try:
+                    registrar_area_cep(
+                        cep=cep_l,
+                        area=area_f,
+                        bairro=bairro_f,
+                        origem="PLANILHA_ATIVA",
+                        conn=cep_conn,
+                        triagem_conn=triagem_conn,
+                    )
+                except Exception:
+                    pass
+
+        return len(atualizacoes_backlog) + len(insercoes_backlog)
+    finally:
+        if close_triagem:
+            triagem_conn.close()
+        if close_cep and cep_conn is not None:
+            cep_conn.close()
 
 
 def aplicar_regras_condicionais(ws, sqref: str) -> None:
@@ -167,7 +686,7 @@ def gerar_planilha_trabalho(
     """Gera o arquivo Planilha_Controle_VRE_Ativa.xlsx a partir dos dados do SQLite.
 
     Garante velocidade máxima e zero travamento injetando apenas Plain Values
-    e aplicando as 12 regras de formatação condicional na exata ordem do exemplo.
+    e aplicando as regras de formatação condicional na exata ordem do exemplo.
     """
     ensure_directories()
     dest_path = Path(caminho_saida) if caminho_saida else OUTPUT_XLSX_PATH
@@ -230,23 +749,32 @@ def gerar_planilha_trabalho(
             except Exception:
                 extras = {}
 
-        # Classificação da nova coluna única 'Restrição'
+        # Classificação da nova coluna única 'Restrição' (preserva edição manual se existir)
         flag_r = int(reg.get("flag_restricao") or 0)
         flag_n = int(reg.get("flag_noturno") or 0)
-        if flag_n:
+        restricao_custom = str(extras.get("RestricaoCustom") or "").strip()
+        if restricao_custom:
+            classificacao_restricao = restricao_custom
+        elif flag_n:
             classificacao_restricao = "Noturno"
         elif flag_r:
             classificacao_restricao = "Com Restrição"
         else:
             classificacao_restricao = "Sem Restrição"
 
-        # Tipo de Serviço sugerido (se tiver fiscal atribuído, noturno é 'Noturno', não 'Livre')
+        # Tipo de Serviço sugerido (se tiver fiscal atribuído e estiver como 'Noturno Livre' ou vazio, passa a 'Noturno',
+        # mas preserva qualquer outro valor editado como 'Noturno entregue')
         fiscal_atribuido_val = (reg.get("fiscal_atribuido") or "").strip()
         tem_dono = bool(fiscal_atribuido_val and fiscal_atribuido_val != "Não Informado")
 
-        tipo_servico = reg.get("tipo_servico")
-        if tem_dono and (flag_n or tipo_servico == "Noturno Livre"):
-            tipo_servico = "Noturno"
+        tipo_servico = (reg.get("tipo_servico") or "").strip()
+        if tem_dono and (not tipo_servico or tipo_servico == "Noturno Livre"):
+            if flag_n or tipo_servico == "Noturno Livre":
+                tipo_servico = "Noturno"
+            elif flag_r:
+                tipo_servico = "Com Restrição Livre"
+            else:
+                tipo_servico = "Sem Restrição Livre"
         elif not tipo_servico:
             if flag_n:
                 tipo_servico = "Noturno Livre"
@@ -255,20 +783,20 @@ def gerar_planilha_trabalho(
             else:
                 tipo_servico = "Sem Restrição Livre"
 
-        # Endereço estático limpo (Plain Values)
+        # Endereço estático limpo (Plain Values), preservando edição manual se houver
         tipo_end = extras.get("TipoEndereco", "")
         logr = extras.get("Logradouro", "")
         num = extras.get("Numero", "")
         comp = extras.get("Complemento", "")
         bairro = reg.get("bairro_original", "") or extras.get("Bairro", "")
-        endereco_calculado = montar_endereco_completo(tipo_end, logr, num, comp, bairro)
+        endereco_calculado = extras.get("EnderecoCustom") or montar_endereco_completo(tipo_end, logr, num, comp, bairro)
 
         # CEP e CEP4 (5 dígitos)
         cep_bruto = str(extras.get("Cep", "") or "")
         cep4 = cep_bruto[:5] if len(cep_bruto) >= 5 else cep_bruto
 
         # Higienização de Status: não deve ser escrito não distribuído e/ou distribuído, apenas deixe vazio
-        status_raw = str(reg.get("status") or "").strip()
+        status_raw = str(extras.get("Status") or reg.get("status") or "").strip()
         status_upper = status_raw.upper()
         if status_upper in [
             "PENDENTE",
@@ -287,8 +815,11 @@ def gerar_planilha_trabalho(
         else:
             status_exibicao = status_raw
 
-        # Data do VRE (usar data do VRE não a colocada)
+        # Data do VRE (usar data do VRE não a colocada, preservando DataCol6 caso tenha sido editada manualmente)
         data_vre = extras.get("Data", "") or reg.get("data_importacao", "")
+        data_col6 = extras.get("DataCol6") or data_vre
+
+        iptu_val = extras.get("Iptu", "") or extras.get("IPTU", "") or ""
 
         # Mapeamento oficial das 32 colunas
         valores_linha = [
@@ -297,8 +828,8 @@ def gerar_planilha_trabalho(
             reg.get("fiscal_atribuido") or "",                        # Col 3 (C): Fiscal
             tipo_servico,                                             # Col 4 (D): Tipo de Serviço
             classificacao_restricao,                                  # Col 5 (E): Restrição (NOVA COLUNA ÚNICA)
-            data_vre,                                                 # Col 6 (F): Data do VRE
-            extras.get("Iptu", "") or "",                             # Col 7 (G): IPTU
+            data_col6,                                                # Col 6 (F): Data
+            iptu_val,                                                 # Col 7 (G): IPTU
             reg.get("area") or "",                                    # Col 8 (H): ÁREA
             endereco_calculado,                                       # Col 9 (I): Endereço
             extras.get("ProtocoloExistente", "") or "",               # Col 10 (J): Protocolo Existente
@@ -322,7 +853,7 @@ def gerar_planilha_trabalho(
             extras.get("FinalidadeEndereco", ""),                     # Col 28 (AB): FinalidadeEndereco
             reg.get("cnaes_licenciadas") or "",                       # Col 29 (AC): CnaesLicenciadas
             extras.get("CnaesNaoLicenciadas", ""),                    # Col 30 (AD): CnaesNaoLicenciadas
-            extras.get("Iptu", ""),                                   # Col 31 (AE): Iptu
+            iptu_val,                                                 # Col 31 (AE): Iptu
             cep4,                                                     # Col 32 (AF): CEP4
         ]
 
@@ -385,6 +916,9 @@ def gerar_planilha_trabalho(
     ws.freeze_panes = "A3"
     wb.save(str(dest_path))
 
+    # Registra hash em memória da planilha gerada pelo sistema
+    registrar_hash_planilha_gerada(dest_path)
+
     # Sincroniza saída e template com a pasta fbuild se existir
     try:
         fbuild_dir = BASE_DIR / "fbuild"
@@ -392,6 +926,7 @@ def gerar_planilha_trabalho(
             fbuild_saida = fbuild_dir / "Planilha_Controle_VRE_Ativa.xlsx"
             if dest_path.resolve() != fbuild_saida.resolve():
                 shutil.copy2(str(dest_path), str(fbuild_saida))
+                registrar_hash_planilha_gerada(fbuild_saida)
             fbuild_tmpl = fbuild_dir / "Configurações" / "templates" / "template_triagem.xlsx"
             if template_path.resolve() != fbuild_tmpl.resolve() and template_path.exists():
                 fbuild_tmpl.parent.mkdir(parents=True, exist_ok=True)
@@ -400,4 +935,5 @@ def gerar_planilha_trabalho(
         pass
 
     return dest_path
+
 

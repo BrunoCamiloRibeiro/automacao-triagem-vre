@@ -28,7 +28,11 @@ from src.core.config import (
     resolve_template_path,
 )
 from src.core.database import db_transaction, get_triagem_db, initialize_schema_if_needed
-from src.core.excel_writer import gerar_planilha_trabalho
+from src.core.excel_writer import (
+    gerar_planilha_trabalho,
+    registrar_hash_planilha_gerada,
+    sincronizar_planilha_ativa_com_banco,
+)
 from src.core.normalizer import formatar_cnpj, normalizar_cnpj
 
 
@@ -85,13 +89,13 @@ def obter_estatisticas_gerais(conn: sqlite3.Connection | None = None) -> dict[st
         cur.execute("SELECT COUNT(*) FROM vre_backlog;")
         total_backlog = cur.fetchone()[0]
 
-        cur.execute("SELECT COUNT(*) FROM vre_backlog WHERE status = 'PENDENTE';")
+        cur.execute("SELECT COUNT(*) FROM vre_backlog WHERE UPPER(COALESCE(status, 'PENDENTE')) = 'PENDENTE';")
         total_pendentes = cur.fetchone()[0]
 
-        cur.execute("SELECT COUNT(*) FROM vre_backlog WHERE status = 'DISTRIBUIDO';")
+        cur.execute("SELECT COUNT(*) FROM vre_backlog WHERE UPPER(status) IN ('DISTRIBUIDO', 'DISTRIBUÍDO', 'EM ANDAMENTO');")
         total_distribuidos = cur.fetchone()[0]
 
-        cur.execute("SELECT COUNT(*) FROM vre_backlog WHERE status = 'FINALIZADO';")
+        cur.execute("SELECT COUNT(*) FROM vre_backlog WHERE UPPER(status) IN ('FINALIZADO', 'DEFERIDO', 'INDEFERIDO', 'CANCELADO', 'CASSADO');")
         total_finalizados = cur.fetchone()[0]
 
         cur.execute("SELECT COUNT(*) FROM historico_fiscais;")
@@ -109,10 +113,9 @@ def obter_estatisticas_gerais(conn: sqlite3.Connection | None = None) -> dict[st
         cur.execute(
             """
             SELECT COUNT(*) FROM vre_backlog
-            WHERE status IN ('PENDENTE', 'DISTRIBUIDO')
-              AND mes_competencia NOT IN (
-                  SELECT mes_competencia FROM controle_competencias WHERE arquivado = 1
-              );
+            WHERE mes_competencia NOT IN (
+                SELECT mes_competencia FROM controle_competencias WHERE arquivado = 1
+            );
             """
         )
         protocolos_ativos_visiveis = cur.fetchone()[0]
@@ -153,9 +156,9 @@ def listar_competencias_status(
                 c.mes_competencia,
                 c.arquivado,
                 COUNT(b.protocolo_licenca) as total,
-                SUM(CASE WHEN b.status = 'PENDENTE' THEN 1 ELSE 0 END) as pendentes,
-                SUM(CASE WHEN b.status = 'DISTRIBUIDO' THEN 1 ELSE 0 END) as distribuidos,
-                SUM(CASE WHEN b.status = 'FINALIZADO' THEN 1 ELSE 0 END) as finalizados
+                SUM(CASE WHEN UPPER(COALESCE(b.status, 'PENDENTE')) = 'PENDENTE' THEN 1 ELSE 0 END) as pendentes,
+                SUM(CASE WHEN UPPER(b.status) IN ('DISTRIBUIDO', 'DISTRIBUÍDO', 'EM ANDAMENTO') THEN 1 ELSE 0 END) as distribuidos,
+                SUM(CASE WHEN UPPER(b.status) IN ('FINALIZADO', 'DEFERIDO', 'INDEFERIDO', 'CANCELADO', 'CASSADO') THEN 1 ELSE 0 END) as finalizados
             FROM controle_competencias c
             LEFT JOIN vre_backlog b ON b.mes_competencia = c.mes_competencia
             GROUP BY c.mes_competencia
@@ -289,7 +292,7 @@ def arquivar_competencia(
         cur.execute("SELECT COUNT(*) FROM vre_backlog WHERE mes_competencia = ?;", (comp_limpa,))
         total_prot = cur.fetchone()[0]
 
-        # Sincroniza atendimentos finalizados com fiscal para historico_fiscais
+        # Sincroniza atendimentos com fiscal para historico_fiscais
         with db_transaction(conn) as t_cur:
             t_cur.execute(
                 """
@@ -297,11 +300,10 @@ def arquivar_competencia(
                 SELECT
                     cnpj_limpo,
                     TRIM(fiscal_atribuido),
-                    COALESCE(data_finalizacao, DATE('now')),
+                    COALESCE(data_finalizacao, data_importacao, DATE('now')),
                     ('Mes_' || mes_competencia)
                 FROM vre_backlog
                 WHERE mes_competencia = ?
-                  AND status = 'FINALIZADO'
                   AND cnpj_limpo != ''
                   AND fiscal_atribuido IS NOT NULL
                   AND TRIM(fiscal_atribuido) != ''
@@ -365,9 +367,10 @@ def aplicar_reorganizacao_planilha(
     """Aplica as alterações de visibilidade e gera a nova planilha de trabalho ativa.
 
     1. Copia a planilha de trabalho atual para 'Planilhas anteriores/' (backup datado).
-    2. Processa novos arquivos CSV caso existam na raiz ou na pasta de entrada.
-    3. Consulta todos os protocolos do backlog cujos meses NÃO estejam arquivados.
-    4. Gera a nova Planilha_Controle_VRE_Ativa.xlsx institucional de 32 colunas.
+    2. Sincroniza edições manuais feitas na planilha ativa em uso para o SQLite.
+    3. Processa novos arquivos CSV caso existam na raiz ou na pasta de entrada.
+    4. Consulta todos os protocolos do backlog cujos meses NÃO estejam arquivados.
+    5. Gera a nova Planilha_Controle_VRE_Ativa.xlsx institucional de 32 colunas.
     """
     # 1. Backup da planilha em uso
     backup_path = fazer_backup_planilha_ativa(caminho_planilha=saida_xlsx)
@@ -377,10 +380,11 @@ def aplicar_reorganizacao_planilha(
 
     csv_pendente = localizar_arquivo_csv()
     csv_nome = None
+    close_conn = False
 
     if csv_pendente is not None and csv_pendente.exists():
         csv_nome = csv_pendente.name
-        # Executa o runner seco que já inclui o novo CSV e respeita as competências
+        # Executa o runner seco que já sincroniza a planilha ativa, inclui o novo CSV e respeita as competências
         linhas_geradas = processar_fluxo_seco(
             caminho_csv=csv_pendente,
             saida_xlsx=saida_xlsx,
@@ -388,8 +392,7 @@ def aplicar_reorganizacao_planilha(
             silencioso=True,
         )
     else:
-        # Se não há CSV novo, monta a planilha a partir do banco de dados respeitando os meses ativos
-        close_conn = False
+        # Se não há CSV novo, sincroniza edições da planilha ativa e monta a partir do banco respeitando os meses ativos
         if conn is None:
             conn = get_triagem_db()
             close_conn = True
@@ -397,8 +400,16 @@ def aplicar_reorganizacao_planilha(
         try:
             initialize_schema_if_needed(conn, is_cep=False)
             garantir_tabela_controle(conn)
-            cur = conn.cursor()
 
+            p_saida = Path(saida_xlsx) if saida_xlsx else resolve_output_xlsx_path()
+            p_tpl = Path(caminho_template) if caminho_template else resolve_template_path()
+
+            sincronizar_planilha_ativa_com_banco(
+                caminho_xlsx=p_saida,
+                triagem_conn=conn,
+            )
+
+            cur = conn.cursor()
             cur.execute(
                 """
                 SELECT
@@ -408,23 +419,20 @@ def aplicar_reorganizacao_planilha(
                     flag_restricao, flag_noturno, tipo_servico, status,
                     data_finalizacao, dados_extras_json
                 FROM vre_backlog
-                WHERE status IN ('PENDENTE', 'DISTRIBUIDO')
-                  AND mes_competencia NOT IN (
-                      SELECT mes_competencia FROM controle_competencias WHERE arquivado = 1
-                  )
+                WHERE mes_competencia NOT IN (
+                    SELECT mes_competencia FROM controle_competencias WHERE arquivado = 1
+                )
                 ORDER BY mes_competencia ASC, data_importacao ASC, protocolo_sil ASC;
                 """
             )
             linhas_backlog = [dict(r) for r in cur.fetchall()]
-
-            p_saida = Path(saida_xlsx) if saida_xlsx else resolve_output_xlsx_path()
-            p_tpl = Path(caminho_template) if caminho_template else resolve_template_path()
 
             gerar_planilha_trabalho(
                 registros_backlog=linhas_backlog,
                 caminho_saida=p_saida,
                 caminho_template=p_tpl,
             )
+            registrar_hash_planilha_gerada(p_saida, conn)
             linhas_geradas = len(linhas_backlog)
         finally:
             if close_conn:
