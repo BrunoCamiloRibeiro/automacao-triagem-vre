@@ -294,7 +294,7 @@ def processar_fluxo_seco(
 
             # 3. Sugestão de Tipo de Serviço
             if flag_noturno == 1:
-                tipo_servico = "Noturno Livre"
+                tipo_servico = "Noturno" if fiscal_historico else "Noturno Livre"
             elif flag_restr == 1:
                 tipo_servico = "Com Restrição Livre"
             else:

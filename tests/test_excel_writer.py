@@ -48,13 +48,13 @@ class TestExcelWriter(unittest.TestCase):
         self.assertEqual(len(ws.conditional_formatting), 1)
         cf_block = list(ws.conditional_formatting)[0]
         self.assertEqual(len(cf_block.rules), 15)
-        self.assertEqual(cf_block.rules[0].formula[0], '$D3="Sem Restrição Livre"')
-        self.assertEqual(cf_block.rules[1].formula[0], '$E3="Sem Restrição"')
-        self.assertEqual(cf_block.rules[2].formula[0], '$P3="INDEFERIDO"')
-        self.assertEqual(cf_block.rules[3].formula[0], '$P3="CANCELADO"')
-        self.assertEqual(cf_block.rules[6].formula[0], '$E3="Noturno"')
-        self.assertEqual(cf_block.rules[13].formula[0], '$E3="Com Restrição"')
-        self.assertEqual(cf_block.rules[14].formula[0], '$C3<>""')
+        self.assertEqual(cf_block.rules[0].formula[0], '$B3="Em Andamento"')
+        self.assertEqual(cf_block.rules[5].formula[0], '$P3="INDEFERIDO"')
+        self.assertEqual(cf_block.rules[6].formula[0], '$P3="CANCELADO"')
+        self.assertEqual(cf_block.rules[7].formula[0], '$D3="Noturno entregue"')
+        self.assertEqual(cf_block.rules[8].formula[0], '$C3<>""')
+        self.assertEqual(cf_block.rules[9].formula[0], '$D3="Noturno Livre"')
+        self.assertEqual(cf_block.rules[10].formula[0], '$E3="Noturno"')
 
 
     def test_gerar_planilha_plain_values_e_flags(self) -> None:
@@ -128,7 +128,7 @@ class TestExcelWriter(unittest.TestCase):
         self.assertEqual(ws.cell(row=3, column=1).value, 1)  # Seq 1
         self.assertIn(ws.cell(row=3, column=2).value, ("", None)) # Status vazio (não distribuído / pendente)
         self.assertEqual(ws.cell(row=3, column=3).value, "Fiscal_Alfa")
-        self.assertEqual(ws.cell(row=3, column=4).value, "Noturno Livre")
+        self.assertEqual(ws.cell(row=3, column=4).value, "Noturno")
         self.assertEqual(ws.cell(row=3, column=5).value, "Noturno")    # Nova coluna Restrição
         self.assertEqual(ws.cell(row=3, column=6).value, "15/05/2026") # Data
         self.assertEqual(ws.cell(row=3, column=7).value, "0307968000") # IPTU
@@ -150,12 +150,10 @@ class TestExcelWriter(unittest.TestCase):
         self.assertEqual(len(ws.conditional_formatting), 1)
         cf_rules = list(ws.conditional_formatting)[0].rules
         self.assertEqual(len(cf_rules), 15)
-        self.assertEqual(cf_rules[0].formula[0], '$D3="Sem Restrição Livre"')
-        self.assertEqual(cf_rules[1].formula[0], '$E3="Sem Restrição"')
-        self.assertEqual(cf_rules[2].formula[0], '$P3="INDEFERIDO"')
-        self.assertEqual(cf_rules[12].formula[0], '$D3="Com Restrição Livre"')
-        self.assertEqual(cf_rules[13].formula[0], '$E3="Com Restrição"')
-        self.assertEqual(cf_rules[14].formula[0], '$C3<>""')
+        self.assertEqual(cf_rules[0].formula[0], '$B3="Em Andamento"')
+        self.assertEqual(cf_rules[8].formula[0], '$C3<>""')
+        self.assertEqual(cf_rules[9].formula[0], '$D3="Noturno Livre"')
+        self.assertEqual(cf_rules[10].formula[0], '$E3="Noturno"')
 
     def test_status_distribuido_e_pendente_fica_vazio(self) -> None:
         """Garante que não deve ser escrito não distribuído e/ou distribuído, apenas deixe vazio."""

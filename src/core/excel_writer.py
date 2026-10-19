@@ -81,21 +81,21 @@ COLUNAS_CABECALHO = [
 
 # Regras de Formatação Condicional na EXATA ordem e prioridade institucional
 REGRAS_CONDICIONAIS_ORDEM = [
-    ('$D3="Sem Restrição Livre"', COR_SEM_RESTRICAO),
-    ('$E3="Sem Restrição"', COR_SEM_RESTRICAO),
-    ('$P3="INDEFERIDO"', COR_INDEFERIDO),
-    ('$P3="CANCELADO"', COR_INDEFERIDO),
-    ('$D3="Noturno entregue"', COR_NOTURNO_ENTREGUE),
-    ('$D3="Noturno Livre"', COR_NOTURNO_LIVRE),
-    ('$E3="Noturno"', COR_NOTURNO_LIVRE),
     ('$B3="Em Andamento"', COR_EM_ANDAMENTO),
     ('$B3="Indeferido"', COR_FINALIZADO_STATUS),
     ('$B3="Cancelado"', COR_FINALIZADO_STATUS),
     ('$B3="Cassado"', COR_FINALIZADO_STATUS),
     ('$B3="Deferido"', COR_FINALIZADO_STATUS),
+    ('$P3="INDEFERIDO"', COR_INDEFERIDO),
+    ('$P3="CANCELADO"', COR_INDEFERIDO),
+    ('$D3="Noturno entregue"', COR_NOTURNO_ENTREGUE),
+    ('$C3<>""', COR_FISCAL_ATRIBUIDO),
+    ('$D3="Noturno Livre"', COR_NOTURNO_LIVRE),
+    ('$E3="Noturno"', COR_NOTURNO_LIVRE),
+    ('$D3="Sem Restrição Livre"', COR_SEM_RESTRICAO),
+    ('$E3="Sem Restrição"', COR_SEM_RESTRICAO),
     ('$D3="Com Restrição Livre"', COR_RESTRICAO_LIVRE),
     ('$E3="Com Restrição"', COR_RESTRICAO_LIVRE),
-    ('$C3<>""', COR_FISCAL_ATRIBUIDO),
 ]
 
 
@@ -240,9 +240,14 @@ def gerar_planilha_trabalho(
         else:
             classificacao_restricao = "Sem Restrição"
 
-        # Tipo de Serviço sugerido (mantém valor existente ou deduz)
+        # Tipo de Serviço sugerido (se tiver fiscal atribuído, noturno é 'Noturno', não 'Livre')
+        fiscal_atribuido_val = (reg.get("fiscal_atribuido") or "").strip()
+        tem_dono = bool(fiscal_atribuido_val and fiscal_atribuido_val != "Não Informado")
+
         tipo_servico = reg.get("tipo_servico")
-        if not tipo_servico:
+        if tem_dono and (flag_n or tipo_servico == "Noturno Livre"):
+            tipo_servico = "Noturno"
+        elif not tipo_servico:
             if flag_n:
                 tipo_servico = "Noturno Livre"
             elif flag_r:

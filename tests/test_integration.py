@@ -246,7 +246,7 @@ class TestIntegracaoCompleta(unittest.TestCase):
             self.assertEqual(r1["fiscal_atribuido"], "Fiscal_Alfa", "Deve herdar o fiscal histórico atribuído.")
             self.assertEqual(r1["flag_noturno"], 1, "Deve marcar Noturno=1.")
             self.assertEqual(r1["flag_restricao"], 0, "Deve manter Restrição=0.")
-            self.assertEqual(r1["tipo_servico"], "Noturno Livre")
+            self.assertEqual(r1["tipo_servico"], "Noturno")
             self.assertEqual(r1["area"], "REPRESA", "Deve resolver Área pelo Bairro normalizado.")
 
             # Registro 2
@@ -324,7 +324,7 @@ class TestIntegracaoCompleta(unittest.TestCase):
             self.assertEqual(ws.max_column, 32)
 
             # Linha 3 (LIC_001 - Noturno)
-            self.assertEqual(ws.cell(row=3, column=4).value, "Noturno Livre")
+            self.assertEqual(ws.cell(row=3, column=4).value, "Noturno")
             self.assertEqual(ws.cell(row=3, column=5).value, "Noturno")
             self.assertEqual(ws.cell(row=3, column=8).value, "REPRESA")
 

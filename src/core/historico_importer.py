@@ -268,7 +268,12 @@ def reconciliar_fiscais_backlog(triagem_conn) -> int:
                 WHERE h.cnpj_limpo = vre_backlog.cnpj_limpo
                 ORDER BY h.data_atendimento DESC, h.id DESC
                 LIMIT 1
-            )
+            ),
+            tipo_servico = CASE
+                WHEN flag_noturno = 1 AND (tipo_servico = 'Noturno Livre' OR tipo_servico IS NULL OR TRIM(tipo_servico) = '')
+                THEN 'Noturno'
+                ELSE tipo_servico
+            END
             WHERE (fiscal_atribuido IS NULL OR TRIM(fiscal_atribuido) = '' OR fiscal_atribuido = 'Não Informado')
               AND EXISTS (
                   SELECT 1 FROM historico_fiscais h WHERE h.cnpj_limpo = vre_backlog.cnpj_limpo
