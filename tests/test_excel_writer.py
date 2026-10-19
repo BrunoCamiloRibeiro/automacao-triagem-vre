@@ -135,11 +135,11 @@ class TestExcelWriter(unittest.TestCase):
         self.assertEqual(ws.cell(row=3, column=8).value, "CENTRAL")     # ÁREA
         self.assertEqual(ws.cell(row=3, column=9).value, "RUA AIMORES, 287 - VILA ANCHIETA")
 
-        # Linha 4 (Restrição ativa, status DISTRIBUIDO deve ficar vazio)
+        # Linha 4 (Restrição ativa, tem dono 'Fiscal_Beta' e não é noturno -> Tipo de Serviço = 'Diurno Livre')
         self.assertEqual(ws.cell(row=4, column=1).value, 2)  # Seq 2
         self.assertIn(ws.cell(row=4, column=2).value, ("", None)) # Status vazio (distribuído)
         self.assertEqual(ws.cell(row=4, column=3).value, "Fiscal_Beta")
-        self.assertEqual(ws.cell(row=4, column=4).value, "Com Restrição Livre")
+        self.assertEqual(ws.cell(row=4, column=4).value, "Diurno Livre")
         self.assertEqual(ws.cell(row=4, column=5).value, "Com Restrição") # Nova coluna Restrição
         self.assertEqual(ws.cell(row=4, column=6).value, "16/05/2026")
         self.assertEqual(ws.cell(row=4, column=7).value, "0554051005")

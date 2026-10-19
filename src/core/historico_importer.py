@@ -276,6 +276,9 @@ def reconciliar_fiscais_backlog(triagem_conn) -> int:
             tipo_servico = CASE
                 WHEN flag_noturno = 1 AND (tipo_servico = 'Noturno Livre' OR tipo_servico IS NULL OR TRIM(tipo_servico) = '')
                 THEN 'Noturno'
+                WHEN (flag_noturno = 0 OR flag_noturno IS NULL)
+                     AND (tipo_servico IN ('Com Restrição Livre', 'Sem Restrição Livre', 'Com Restricao Livre', 'Sem Restricao Livre') OR tipo_servico IS NULL OR TRIM(tipo_servico) = '')
+                THEN 'Diurno Livre'
                 ELSE tipo_servico
             END
             WHERE (fiscal_atribuido IS NULL OR TRIM(fiscal_atribuido) = '' OR fiscal_atribuido = 'Não Informado')

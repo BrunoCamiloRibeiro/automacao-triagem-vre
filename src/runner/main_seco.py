@@ -308,6 +308,8 @@ def processar_fluxo_seco(
             # 3. Sugestão de Tipo de Serviço
             if flag_noturno == 1:
                 tipo_servico = "Noturno" if fiscal_historico else "Noturno Livre"
+            elif fiscal_historico:
+                tipo_servico = "Diurno Livre"
             elif flag_restr == 1:
                 tipo_servico = "Com Restrição Livre"
             else:
@@ -381,6 +383,27 @@ def processar_fluxo_seco(
 
     # 5. Reconciliação automática: resolve Área para protocolos pendentes cujos CEPs ou Bairros foram mapeados
     reconciliar_areas_backlog(triagem_conn=conn_triagem, cep_conn=conn_cep)
+
+    # Garante que todo protocolo no backlog que tenha dono (fiscal atribuído) e não seja noturno use 'Diurno Livre'
+    # caso ainda esteja com classificação livre de sem dono
+    with db_transaction(conn_triagem) as cur_norm:
+        cur_norm.execute(
+            """
+            UPDATE vre_backlog
+            SET tipo_servico = CASE
+                WHEN flag_noturno = 1 THEN 'Noturno'
+                ELSE 'Diurno Livre'
+            END
+            WHERE fiscal_atribuido IS NOT NULL
+              AND TRIM(fiscal_atribuido) != ''
+              AND fiscal_atribuido != 'Não Informado'
+              AND (
+                  tipo_servico IS NULL
+                  OR TRIM(tipo_servico) = ''
+                  OR tipo_servico IN ('Noturno Livre', 'Com Restrição Livre', 'Sem Restrição Livre', 'Com Restricao Livre', 'Sem Restricao Livre')
+              );
+            """
+        )
 
     # 6. Recuperação de todos os protocolos dos meses ativos (não arquivados)
     cur_triagem = conn_triagem.cursor()

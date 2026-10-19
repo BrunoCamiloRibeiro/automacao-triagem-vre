@@ -419,10 +419,26 @@ def sincronizar_planilha_ativa_com_banco(
             else:
                 extras.pop("RestricaoCustom", None)
 
-            # Tipo de Serviço
-            tipo_servico_final = tipo_servico_excel
-            if tipo_servico_excel:
-                extras["TipoServicoCustom"] = tipo_servico_excel
+            # Tipo de Serviço (quando tem dono e não é noturno -> Diurno Livre, salvo se editado para Cota/VP/Entregue/etc.)
+            tem_dono_excel = bool(
+                fiscal_excel and fiscal_excel.upper() not in ("NÃO INFORMADO", "NAO INFORMADO", "PENDENTE")
+            )
+            if tem_dono_excel and (
+                not tipo_servico_excel
+                or tipo_servico_excel in (
+                    "Noturno Livre",
+                    "Com Restrição Livre",
+                    "Sem Restrição Livre",
+                    "Com Restricao Livre",
+                    "Sem Restricao Livre",
+                )
+            ):
+                tipo_servico_final = "Noturno" if (flag_n or tipo_servico_excel == "Noturno Livre") else "Diurno Livre"
+            else:
+                tipo_servico_final = tipo_servico_excel
+
+            if tipo_servico_final:
+                extras["TipoServicoCustom"] = tipo_servico_final
             else:
                 extras.pop("TipoServicoCustom", None)
 
@@ -762,19 +778,26 @@ def gerar_planilha_trabalho(
         else:
             classificacao_restricao = "Sem Restrição"
 
-        # Tipo de Serviço sugerido (se tiver fiscal atribuído e estiver como 'Noturno Livre' ou vazio, passa a 'Noturno',
-        # mas preserva qualquer outro valor editado como 'Noturno entregue')
+        # Tipo de Serviço sugerido (quando tem dono: se for noturno -> 'Noturno', se não for noturno -> 'Diurno Livre',
+        # preservando qualquer outro valor editado como 'Noturno entregue', 'Cota', 'VP', etc.)
         fiscal_atribuido_val = (reg.get("fiscal_atribuido") or "").strip()
         tem_dono = bool(fiscal_atribuido_val and fiscal_atribuido_val != "Não Informado")
 
         tipo_servico = (reg.get("tipo_servico") or "").strip()
-        if tem_dono and (not tipo_servico or tipo_servico == "Noturno Livre"):
+        if tem_dono and (
+            not tipo_servico
+            or tipo_servico in (
+                "Noturno Livre",
+                "Com Restrição Livre",
+                "Sem Restrição Livre",
+                "Com Restricao Livre",
+                "Sem Restricao Livre",
+            )
+        ):
             if flag_n or tipo_servico == "Noturno Livre":
                 tipo_servico = "Noturno"
-            elif flag_r:
-                tipo_servico = "Com Restrição Livre"
             else:
-                tipo_servico = "Sem Restrição Livre"
+                tipo_servico = "Diurno Livre"
         elif not tipo_servico:
             if flag_n:
                 tipo_servico = "Noturno Livre"
