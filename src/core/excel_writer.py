@@ -402,45 +402,55 @@ def sincronizar_planilha_ativa_com_banco(
                 status_db = status_excel
                 extras["Status"] = status_excel
 
-            # Flags e Restrição
+            eh_indeferido_excel = (
+                situacao_postura_excel.strip().upper() == "INDEFERIDO"
+                or status_upper == "INDEFERIDO"
+            )
+
+            # Flags e Restrição (quando indeferido, não deve preencher Tipo de Serviço nem Restrição)
             flag_r = int(reg_ant.get("flag_restricao") or 0) if reg_ant else 0
             flag_n = int(reg_ant.get("flag_noturno") or 0) if reg_ant else 0
-            if restricao_excel:
-                r_up = restricao_excel.upper()
-                if "NOTURNO" in r_up:
-                    flag_n = 1
-                elif "RESTRI" in r_up and "SEM" not in r_up:
-                    flag_r = 1
-                    flag_n = 0
-                elif "SEM" in r_up:
-                    flag_r = 0
-                    flag_n = 0
-                extras["RestricaoCustom"] = restricao_excel
-            else:
+            if eh_indeferido_excel:
                 extras.pop("RestricaoCustom", None)
-
-            # Tipo de Serviço (quando tem dono e não é noturno -> Diurno Livre, salvo se editado para Cota/VP/Entregue/etc.)
-            tem_dono_excel = bool(
-                fiscal_excel and fiscal_excel.upper() not in ("NÃO INFORMADO", "NAO INFORMADO", "PENDENTE")
-            )
-            if tem_dono_excel and (
-                not tipo_servico_excel
-                or tipo_servico_excel in (
-                    "Noturno Livre",
-                    "Com Restrição Livre",
-                    "Sem Restrição Livre",
-                    "Com Restricao Livre",
-                    "Sem Restricao Livre",
-                )
-            ):
-                tipo_servico_final = "Noturno" if (flag_n or tipo_servico_excel == "Noturno Livre") else "Diurno Livre"
-            else:
-                tipo_servico_final = tipo_servico_excel
-
-            if tipo_servico_final:
-                extras["TipoServicoCustom"] = tipo_servico_final
-            else:
                 extras.pop("TipoServicoCustom", None)
+                tipo_servico_final = ""
+            else:
+                if restricao_excel:
+                    r_up = restricao_excel.upper()
+                    if "NOTURNO" in r_up:
+                        flag_n = 1
+                    elif "RESTRI" in r_up and "SEM" not in r_up:
+                        flag_r = 1
+                        flag_n = 0
+                    elif "SEM" in r_up:
+                        flag_r = 0
+                        flag_n = 0
+                    extras["RestricaoCustom"] = restricao_excel
+                else:
+                    extras.pop("RestricaoCustom", None)
+
+                # Tipo de Serviço (quando tem dono e não é noturno -> Diurno Livre, salvo se editado para Cota/VP/Entregue/etc.)
+                tem_dono_excel = bool(
+                    fiscal_excel and fiscal_excel.upper() not in ("NÃO INFORMADO", "NAO INFORMADO", "PENDENTE")
+                )
+                if tem_dono_excel and (
+                    not tipo_servico_excel
+                    or tipo_servico_excel in (
+                        "Noturno Livre",
+                        "Com Restrição Livre",
+                        "Sem Restrição Livre",
+                        "Com Restricao Livre",
+                        "Sem Restricao Livre",
+                    )
+                ):
+                    tipo_servico_final = "Noturno" if (flag_n or tipo_servico_excel == "Noturno Livre") else "Diurno Livre"
+                else:
+                    tipo_servico_final = tipo_servico_excel
+
+                if tipo_servico_final:
+                    extras["TipoServicoCustom"] = tipo_servico_final
+                else:
+                    extras.pop("TipoServicoCustom", None)
 
             # IPTU (prioriza edição na Coluna 7 ou Coluna 31)
             iptu_ant = str(extras.get("Iptu") or extras.get("IPTU") or "")
@@ -634,6 +644,85 @@ def sincronizar_planilha_ativa_com_banco(
             cep_conn.close()
 
 
+def limpar_indeferidos_e_normalizar_backlog(triagem_conn: sqlite3.Connection) -> int:
+    """Garante para todos os registros do backlog (inclusive os passados):
+    1. Quando está indeferido (SituacaoPostura == 'INDEFERIDO' ou Status == 'Indeferido'),
+       limpa Tipo de Serviço e Restrição (somente quando indeferido).
+    2. Quando não está indeferido e tem dono (fiscal atribuído):
+       se não é noturno e está com classificação livre sem dono, muda para 'Diurno Livre' (ou 'Noturno' se noturno).
+    """
+    cur = triagem_conn.cursor()
+    cur.execute(
+        """
+        SELECT protocolo_licenca, fiscal_atribuido, flag_restricao, flag_noturno,
+               tipo_servico, status, dados_extras_json
+        FROM vre_backlog;
+        """
+    )
+    linhas = cur.fetchall()
+    atualizacoes: list[tuple[str, str, str]] = []
+
+    for r in linhas:
+        prot_lic = r["protocolo_licenca"]
+        fisc = str(r["fiscal_atribuido"] or "").strip()
+        flag_n = int(r["flag_noturno"] or 0)
+        ts_atual = str(r["tipo_servico"] or "").strip()
+        status_db = str(r["status"] or "").strip()
+        raw_json = r["dados_extras_json"] or "{}"
+        try:
+            extras = json.loads(raw_json)
+        except Exception:
+            extras = {}
+
+        postura_up = str(extras.get("SituacaoPostura") or "").strip().upper()
+        status_ex_up = str(extras.get("Status") or "").strip().upper()
+        eh_indeferido = (
+            postura_up == "INDEFERIDO"
+            or status_db.upper() == "INDEFERIDO"
+            or status_ex_up == "INDEFERIDO"
+        )
+
+        if eh_indeferido:
+            mudou_json = False
+            if "RestricaoCustom" in extras:
+                extras.pop("RestricaoCustom", None)
+                mudou_json = True
+            if "TipoServicoCustom" in extras:
+                extras.pop("TipoServicoCustom", None)
+                mudou_json = True
+            if ts_atual != "" or mudou_json:
+                novo_json = json.dumps(extras, ensure_ascii=False) if mudou_json else raw_json
+                atualizacoes.append(("", novo_json, prot_lic))
+        else:
+            tem_dono = bool(fisc and fisc.upper() not in ("NÃO INFORMADO", "NAO INFORMADO", "PENDENTE"))
+            if tem_dono and (
+                not ts_atual
+                or ts_atual in (
+                    "Noturno Livre",
+                    "Com Restrição Livre",
+                    "Sem Restrição Livre",
+                    "Com Restricao Livre",
+                    "Sem Restricao Livre",
+                )
+            ):
+                novo_ts = "Noturno" if (flag_n == 1 or ts_atual == "Noturno Livre") else "Diurno Livre"
+                if novo_ts != ts_atual:
+                    atualizacoes.append((novo_ts, raw_json, prot_lic))
+
+    if atualizacoes:
+        with db_transaction(triagem_conn) as t_cur:
+            t_cur.executemany(
+                """
+                UPDATE vre_backlog
+                SET tipo_servico = ?,
+                    dados_extras_json = ?
+                WHERE protocolo_licenca = ?;
+                """,
+                atualizacoes,
+            )
+    return len(atualizacoes)
+
+
 def aplicar_regras_condicionais(ws, sqref: str) -> None:
     """Aplica as regras de formatação condicional na exata ordem institucional do exemplo."""
     for formula, cor in REGRAS_CONDICIONAIS_ORDEM:
@@ -765,59 +854,6 @@ def gerar_planilha_trabalho(
             except Exception:
                 extras = {}
 
-        # Classificação da nova coluna única 'Restrição' (preserva edição manual se existir)
-        flag_r = int(reg.get("flag_restricao") or 0)
-        flag_n = int(reg.get("flag_noturno") or 0)
-        restricao_custom = str(extras.get("RestricaoCustom") or "").strip()
-        if restricao_custom:
-            classificacao_restricao = restricao_custom
-        elif flag_n:
-            classificacao_restricao = "Noturno"
-        elif flag_r:
-            classificacao_restricao = "Com Restrição"
-        else:
-            classificacao_restricao = "Sem Restrição"
-
-        # Tipo de Serviço sugerido (quando tem dono: se for noturno -> 'Noturno', se não for noturno -> 'Diurno Livre',
-        # preservando qualquer outro valor editado como 'Noturno entregue', 'Cota', 'VP', etc.)
-        fiscal_atribuido_val = (reg.get("fiscal_atribuido") or "").strip()
-        tem_dono = bool(fiscal_atribuido_val and fiscal_atribuido_val != "Não Informado")
-
-        tipo_servico = (reg.get("tipo_servico") or "").strip()
-        if tem_dono and (
-            not tipo_servico
-            or tipo_servico in (
-                "Noturno Livre",
-                "Com Restrição Livre",
-                "Sem Restrição Livre",
-                "Com Restricao Livre",
-                "Sem Restricao Livre",
-            )
-        ):
-            if flag_n or tipo_servico == "Noturno Livre":
-                tipo_servico = "Noturno"
-            else:
-                tipo_servico = "Diurno Livre"
-        elif not tipo_servico:
-            if flag_n:
-                tipo_servico = "Noturno Livre"
-            elif flag_r:
-                tipo_servico = "Com Restrição Livre"
-            else:
-                tipo_servico = "Sem Restrição Livre"
-
-        # Endereço estático limpo (Plain Values), preservando edição manual se houver
-        tipo_end = extras.get("TipoEndereco", "")
-        logr = extras.get("Logradouro", "")
-        num = extras.get("Numero", "")
-        comp = extras.get("Complemento", "")
-        bairro = reg.get("bairro_original", "") or extras.get("Bairro", "")
-        endereco_calculado = extras.get("EnderecoCustom") or montar_endereco_completo(tipo_end, logr, num, comp, bairro)
-
-        # CEP e CEP4 (5 dígitos)
-        cep_bruto = str(extras.get("Cep", "") or "")
-        cep4 = cep_bruto[:5] if len(cep_bruto) >= 5 else cep_bruto
-
         # Higienização de Status: não deve ser escrito não distribuído e/ou distribuído, apenas deixe vazio
         status_raw = str(extras.get("Status") or reg.get("status") or "").strip()
         status_upper = status_raw.upper()
@@ -837,6 +873,69 @@ def gerar_planilha_trabalho(
             status_exibicao = ""
         else:
             status_exibicao = status_raw
+
+        situacao_postura_val = str(extras.get("SituacaoPostura", "") or "").strip()
+        eh_indeferido = (
+            situacao_postura_val.upper() == "INDEFERIDO"
+            or status_upper == "INDEFERIDO"
+        )
+
+        # Quando está indeferido (somente quando indeferido), não deve preencher Tipo de Serviço e Restrição
+        flag_r = int(reg.get("flag_restricao") or 0)
+        flag_n = int(reg.get("flag_noturno") or 0)
+        if eh_indeferido:
+            classificacao_restricao = ""
+            tipo_servico = ""
+        else:
+            restricao_custom = str(extras.get("RestricaoCustom") or "").strip()
+            if restricao_custom:
+                classificacao_restricao = restricao_custom
+            elif flag_n:
+                classificacao_restricao = "Noturno"
+            elif flag_r:
+                classificacao_restricao = "Com Restrição"
+            else:
+                classificacao_restricao = "Sem Restrição"
+
+            # Tipo de Serviço sugerido (quando tem dono: se for noturno -> 'Noturno', se não for noturno -> 'Diurno Livre',
+            # preservando qualquer outro valor editado como 'Noturno entregue', 'Cota', 'VP', etc.)
+            fiscal_atribuido_val = (reg.get("fiscal_atribuido") or "").strip()
+            tem_dono = bool(fiscal_atribuido_val and fiscal_atribuido_val != "Não Informado")
+
+            tipo_servico = (reg.get("tipo_servico") or "").strip()
+            if tem_dono and (
+                not tipo_servico
+                or tipo_servico in (
+                    "Noturno Livre",
+                    "Com Restrição Livre",
+                    "Sem Restrição Livre",
+                    "Com Restricao Livre",
+                    "Sem Restricao Livre",
+                )
+            ):
+                if flag_n or tipo_servico == "Noturno Livre":
+                    tipo_servico = "Noturno"
+                else:
+                    tipo_servico = "Diurno Livre"
+            elif not tipo_servico:
+                if flag_n:
+                    tipo_servico = "Noturno Livre"
+                elif flag_r:
+                    tipo_servico = "Com Restrição Livre"
+                else:
+                    tipo_servico = "Sem Restrição Livre"
+
+        # Endereço estático limpo (Plain Values), preservando edição manual se houver
+        tipo_end = extras.get("TipoEndereco", "")
+        logr = extras.get("Logradouro", "")
+        num = extras.get("Numero", "")
+        comp = extras.get("Complemento", "")
+        bairro = reg.get("bairro_original", "") or extras.get("Bairro", "")
+        endereco_calculado = extras.get("EnderecoCustom") or montar_endereco_completo(tipo_end, logr, num, comp, bairro)
+
+        # CEP e CEP4 (5 dígitos)
+        cep_bruto = str(extras.get("Cep", "") or "")
+        cep4 = cep_bruto[:5] if len(cep_bruto) >= 5 else cep_bruto
 
         # Data do VRE (usar data do VRE não a colocada, preservando DataCol6 caso tenha sido editada manualmente)
         data_vre = extras.get("Data", "") or reg.get("data_importacao", "")

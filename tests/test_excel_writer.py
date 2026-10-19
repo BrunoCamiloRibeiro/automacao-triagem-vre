@@ -184,8 +184,17 @@ class TestExcelWriter(unittest.TestCase):
 
         # Linhas 8, 9, 10: Status reais de fiscalização devem ser preservados
         self.assertEqual(ws.cell(row=8, column=2).value, "Deferido")
+        self.assertEqual(ws.cell(row=8, column=4).value, "Sem Restrição Livre")
+        self.assertEqual(ws.cell(row=8, column=5).value, "Sem Restrição")
+
+        # Linha 9 (Indeferido): NÃO deve preencher Tipo de Serviço (Col 4) nem Restrição (Col 5)
         self.assertEqual(ws.cell(row=9, column=2).value, "Indeferido")
+        self.assertIn(ws.cell(row=9, column=4).value, ("", None))
+        self.assertIn(ws.cell(row=9, column=5).value, ("", None))
+
         self.assertEqual(ws.cell(row=10, column=2).value, "Em Andamento")
+        self.assertEqual(ws.cell(row=10, column=4).value, "Sem Restrição Livre")
+        self.assertEqual(ws.cell(row=10, column=5).value, "Sem Restrição")
 
     def test_sem_restricao_com_cor_amarela(self) -> None:
         """Garante que 'Sem Restrição' possui regra de formatação condicional com amarelo (FFFFC000)."""

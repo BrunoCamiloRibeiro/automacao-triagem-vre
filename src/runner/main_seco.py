@@ -48,6 +48,7 @@ from src.core.database import (
 )
 from src.core.excel_writer import (
     gerar_planilha_trabalho,
+    limpar_indeferidos_e_normalizar_backlog,
     registrar_hash_planilha_gerada,
     sincronizar_planilha_ativa_com_banco,
 )
@@ -305,8 +306,11 @@ def processar_fluxo_seco(
                     if flag_restr == 1 and flag_noturno == 1:
                         break
 
-            # 3. Sugestão de Tipo de Serviço
-            if flag_noturno == 1:
+            # 3. Sugestão de Tipo de Serviço (quando está indeferido, não preenche Tipo de Serviço)
+            situacao_postura = item.get("SituacaoPostura", "").strip()
+            if situacao_postura.upper() == "INDEFERIDO":
+                tipo_servico = ""
+            elif flag_noturno == 1:
                 tipo_servico = "Noturno" if fiscal_historico else "Noturno Livre"
             elif fiscal_historico:
                 tipo_servico = "Diurno Livre"
@@ -384,26 +388,9 @@ def processar_fluxo_seco(
     # 5. Reconciliação automática: resolve Área para protocolos pendentes cujos CEPs ou Bairros foram mapeados
     reconciliar_areas_backlog(triagem_conn=conn_triagem, cep_conn=conn_cep)
 
-    # Garante que todo protocolo no backlog que tenha dono (fiscal atribuído) e não seja noturno use 'Diurno Livre'
-    # caso ainda esteja com classificação livre de sem dono
-    with db_transaction(conn_triagem) as cur_norm:
-        cur_norm.execute(
-            """
-            UPDATE vre_backlog
-            SET tipo_servico = CASE
-                WHEN flag_noturno = 1 THEN 'Noturno'
-                ELSE 'Diurno Livre'
-            END
-            WHERE fiscal_atribuido IS NOT NULL
-              AND TRIM(fiscal_atribuido) != ''
-              AND fiscal_atribuido != 'Não Informado'
-              AND (
-                  tipo_servico IS NULL
-                  OR TRIM(tipo_servico) = ''
-                  OR tipo_servico IN ('Noturno Livre', 'Com Restrição Livre', 'Sem Restrição Livre', 'Com Restricao Livre', 'Sem Restricao Livre')
-              );
-            """
-        )
+    # Limpa Tipo de Serviço e Restrição de todos os registros indeferidos (inclusive passados)
+    # e garante 'Diurno Livre' quando tem dono e não é noturno
+    limpar_indeferidos_e_normalizar_backlog(conn_triagem)
 
     # 6. Recuperação de todos os protocolos dos meses ativos (não arquivados)
     cur_triagem = conn_triagem.cursor()

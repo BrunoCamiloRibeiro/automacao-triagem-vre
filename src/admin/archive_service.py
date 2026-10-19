@@ -30,6 +30,7 @@ from src.core.config import (
 from src.core.database import db_transaction, get_triagem_db, initialize_schema_if_needed
 from src.core.excel_writer import (
     gerar_planilha_trabalho,
+    limpar_indeferidos_e_normalizar_backlog,
     registrar_hash_planilha_gerada,
     sincronizar_planilha_ativa_com_banco,
 )
@@ -408,6 +409,7 @@ def aplicar_reorganizacao_planilha(
                 caminho_xlsx=p_saida,
                 triagem_conn=conn,
             )
+            limpar_indeferidos_e_normalizar_backlog(conn)
 
             cur = conn.cursor()
             cur.execute(

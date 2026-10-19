@@ -527,6 +527,15 @@ def importar_planilha_historico(
                 status_calc = status_raw_orig
                 status_extra = status_raw_orig
 
+            postura_str = str(row[idx_postura - 1]).strip() if idx_postura and idx_postura <= len(row) and row[idx_postura - 1] else ""
+            eh_indeferido_hist = (
+                postura_str.upper() == "INDEFERIDO"
+                or status_calc.upper() == "INDEFERIDO"
+            )
+            if eh_indeferido_hist:
+                tipo_servico_val = ""
+                restricao_val = ""
+
             comb_classificacao = f"{tipo_servico_val} {restricao_val}".upper()
             flag_noturno = 1 if "NOTURNO" in comb_classificacao else 0
             flag_restricao = 1 if (("RESTRIÇÃO" in comb_classificacao or "RESTRICAO" in comb_classificacao) and "SEM RESTRI" not in comb_classificacao) else 0
@@ -539,7 +548,7 @@ def importar_planilha_historico(
                 "Iptu": iptu_str,
                 "IPTU": iptu_str,
                 "GrauRiscoGeral": str(row[idx_grau_risco - 1]).strip() if idx_grau_risco and idx_grau_risco <= len(row) and row[idx_grau_risco - 1] else "",
-                "SituacaoPostura": str(row[idx_postura - 1]).strip() if idx_postura and idx_postura <= len(row) and row[idx_postura - 1] else "",
+                "SituacaoPostura": postura_str,
                 "InscricaoMunicipal": str(row[idx_insc - 1]).strip() if idx_insc and idx_insc <= len(row) and row[idx_insc - 1] else "",
                 "Telefone": str(row[idx_tel - 1]).strip() if idx_tel and idx_tel <= len(row) and row[idx_tel - 1] else "",
                 "E-mail": str(row[idx_email - 1]).strip() if idx_email and idx_email <= len(row) and row[idx_email - 1] else "",
@@ -714,9 +723,11 @@ def importar_planilha_historico(
             ),
         )
 
-    # 6. Reconcilia o backlog ativo (preenche fiscais e áreas para protocolos sem preenchimento)
+    # 6. Reconcilia o backlog ativo (preenche fiscais e áreas para protocolos sem preenchimento e limpa indeferidos)
     reconciliar_areas_backlog(triagem_conn=conn_triagem, cep_conn=conn_cep)
     reconciliar_fiscais_backlog(triagem_conn=conn_triagem)
+    from src.core.excel_writer import limpar_indeferidos_e_normalizar_backlog
+    limpar_indeferidos_e_normalizar_backlog(conn_triagem)
 
     conn_triagem.close()
     conn_cep.close()
