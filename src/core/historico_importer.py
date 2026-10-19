@@ -727,7 +727,7 @@ def importar_planilha_historico(
     reconciliar_areas_backlog(triagem_conn=conn_triagem, cep_conn=conn_cep)
     reconciliar_fiscais_backlog(triagem_conn=conn_triagem)
     from src.core.excel_writer import limpar_indeferidos_e_normalizar_backlog
-    limpar_indeferidos_e_normalizar_backlog(conn_triagem)
+    limpar_indeferidos_e_normalizar_backlog(conn_triagem, executar_migracao_col_f=False)
 
     conn_triagem.close()
     conn_cep.close()

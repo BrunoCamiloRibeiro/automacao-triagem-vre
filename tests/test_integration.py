@@ -398,6 +398,208 @@ class TestIntegracaoCompleta(unittest.TestCase):
             cfg.TEMPLATE_XLSX_PATH = orig_template
             cfg.OUTPUT_XLSX_PATH = orig_saida
 
+    def test_preservacao_edicoes_manuais_na_planilha_ativa(self) -> None:
+        """
+        Garante que:
+        1. Quando o usuário sobe o CSV do Dia 1, edita a Planilha_Controle_VRE_Ativa.xlsx
+           (ex: Status = Deferido, Em Andamento, Fiscal, ProtocoloSigm, IPTU, Área)
+           e depois sobe o CSV do Dia 2, TODAS as linhas e modificações manuais do Dia 1
+           permanecem intactas na planilha gerada no Dia 2.
+        2. Registros INDEFERIDOS (novos ou passados) ficam sem Tipo de Serviço e sem Restrição.
+        3. A Coluna F (Data) permanece vazia por padrão e preserva apenas datas preenchidas a mão.
+        """
+        import src.core.config as cfg
+
+        orig_triagem = cfg.TRIAGEM_DB_PATH
+        orig_cep = cfg.CEP_DB_PATH
+        orig_template = cfg.TEMPLATE_XLSX_PATH
+        orig_saida = cfg.OUTPUT_XLSX_PATH
+
+        csv_dia1 = self.root / "dia1.csv"
+        csv_dia2 = self.root / "dia2.csv"
+
+        cabecalho = [
+            "ProtocoloSil", "ProtocoloLicenca", "Data", "GrauRiscoGeral",
+            "SituacaoPostura", "InscricaoMunicipal", "Cnpj", "NomeEmpresarial",
+            "Telefone", "E-mail", "TipoEndereco", "Logradouro", "Numero",
+            "Complemento", "Bairro", "Cep", "FinalidadeEndereco",
+            "CnaesLicenciadas", "CnaesNaoLicenciadas", "Iptu",
+        ]
+
+        with open(csv_dia1, mode="w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f, delimiter=";")
+            writer.writerow(cabecalho)
+            writer.writerows([
+                [
+                    "SIL_D1_1", "LIC_D1_1", "01/06/2026", "MEDIO", "DEFERIDO", "2001",
+                    "44.444.444/0001-44", "PADARIA DIA UM LTDA", "17-99994444", "d1@teste.com",
+                    "RUA", "UM", "10", "", "Vila Anchieta", "15050090",
+                    "EXERCICIO DA ATIVIDADE", "561120101", "", "010101000",
+                ],
+                [
+                    "SIL_D1_2", "LIC_D1_2", "01/06/2026", "ALTO", "PENDENTE", "2002",
+                    "55.555.555/0001-55", "MERCADO DIA UM S/A", "17-99995555", "d1b@teste.com",
+                    "AV", "DOIS", "20", "", "Bairro Inexistente", "15081490",
+                    "EXERCICIO DA ATIVIDADE", "461410004", "", "",
+                ],
+            ])
+
+        with open(csv_dia2, mode="w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f, delimiter=";")
+            writer.writerow(cabecalho)
+            writer.writerows([
+                [
+                    "SIL_D2_1", "LIC_D2_1", "02/06/2026", "BAIXO", "DEFERIDO", "2003",
+                    "66.666.666/0001-66", "FARMACIA DIA DOIS LTDA", "17-99996666", "d2@teste.com",
+                    "RUA", "TRES", "30", "", "Jardim Maracana", "15050100",
+                    "EXERCICIO DA ATIVIDADE", "011130101", "", "020202000",
+                ],
+                [
+                    "SIL_D2_INDEF", "LIC_D2_INDEF", "02/06/2026", "ALTO", "INDEFERIDO", "2004",
+                    "77.777.777/0001-77", "EMPRESA INDEFERIDA LTDA", "17-99997777", "indef@teste.com",
+                    "RUA", "QUATRO", "40", "", "Vila Anchieta", "15050090",
+                    "EXERCICIO DA ATIVIDADE", "561120101", "", "030303000",
+                ],
+            ])
+
+        try:
+            cfg.TRIAGEM_DB_PATH = self.db_triagem
+            cfg.CEP_DB_PATH = self.db_cep
+            cfg.TEMPLATE_XLSX_PATH = self.template_xlsx
+            cfg.OUTPUT_XLSX_PATH = self.saida_xlsx
+
+            # Simula um registro passado no banco que estava INDEFERIDO mas tinha Tipo de Serviço e Restrição preenchidos antes do patch
+            conn_t = connect_db(self.db_triagem)
+            conn_t.execute(
+                """
+                INSERT INTO vre_backlog (
+                    protocolo_licenca, protocolo_sil, cnpj_limpo, cnpj_formatado,
+                    nome_empresarial, mes_competencia, data_importacao,
+                    bairro_original, area, cnaes_licenciadas, fiscal_atribuido,
+                    flag_restricao, flag_noturno, tipo_servico, status, dados_extras_json
+                )
+                VALUES (
+                    'LIC_PASSADO_INDEF', 'SIL_PASS_1', '88888888000188', '88.888.888/0001-88',
+                    'EMPRESA PASSADA INDEFERIDA', '2026-06', '2026-06-01',
+                    'Vila Anchieta', 'REPRESA', '561120101', '',
+                    1, 1, 'Noturno Livre', 'PENDENTE',
+                    '{"SituacaoPostura": "INDEFERIDO", "RestricaoCustom": "Noturno", "TipoServicoCustom": "Noturno Livre", "DataCol6": "01/01/2025"}'
+                );
+                """
+            )
+            conn_t.close()
+
+            # 1. Sobe o Dia 1 (2026-06-01)
+            total_d1 = processar_fluxo_seco(
+                caminho_csv=csv_dia1,
+                saida_xlsx=self.saida_xlsx,
+                silencioso=True,
+                triagem_db_path=self.db_triagem,
+                cep_db_path=self.db_cep,
+                template_path=self.template_xlsx,
+            )
+            self.assertEqual(total_d1, 3)
+
+            # 2. Operador abre o Excel do Dia 1 e faz modificações manuais
+            wb_d1 = openpyxl.load_workbook(str(self.saida_xlsx))
+            ws_d1 = wb_d1["Controle VRE"]
+
+            # Mapeia linhas no Dia 1 por ProtocoloLicenca (Coluna 13)
+            mapa_d1 = {ws_d1.cell(row=r, column=13).value: r for r in range(3, ws_d1.max_row + 1)}
+
+            # Verifica que o registro passado indeferido já teve Tipo de Serviço, Restrição e DataCol6 (Col 6) limpos no Dia 1
+            r_pass_d1 = mapa_d1["LIC_PASSADO_INDEF"]
+            self.assertIn(ws_d1.cell(row=r_pass_d1, column=4).value, ("", None))
+            self.assertIn(ws_d1.cell(row=r_pass_d1, column=5).value, ("", None))
+            self.assertIn(ws_d1.cell(row=r_pass_d1, column=6).value, ("", None))
+
+            # Verifica que todas as linhas no Dia 1 iniciam com a Coluna F (6) vazia
+            for r_chk in mapa_d1.values():
+                self.assertIn(ws_d1.cell(row=r_chk, column=6).value, ("", None))
+
+            # Edita LIC_D1_1: muda Status para Deferido, Fiscal, Tipo de Serviço para 'Noturno entregue', Data (Col F) a mão, ProtocoloSigm
+            r1 = mapa_d1["LIC_D1_1"]
+            ws_d1.cell(row=r1, column=2, value="Deferido")
+            ws_d1.cell(row=r1, column=3, value="Fiscal_Gama")
+            ws_d1.cell(row=r1, column=4, value="Noturno entregue")
+            ws_d1.cell(row=r1, column=6, value="18/06/2026")
+            ws_d1.cell(row=r1, column=10, value="Sim")
+            ws_d1.cell(row=r1, column=11, value="2026/99999")
+
+            # Edita LIC_D1_2: muda Status para Em Andamento, Fiscal, preenche IPTU e ÁREA manualmente
+            r2 = mapa_d1["LIC_D1_2"]
+            ws_d1.cell(row=r2, column=2, value="Em Andamento")
+            ws_d1.cell(row=r2, column=3, value="Fiscal_Delta")
+            ws_d1.cell(row=r2, column=7, value="099988800")
+            ws_d1.cell(row=r2, column=8, value="CENTRO")
+            ws_d1.cell(row=r2, column=11, value="OS-1234")
+
+            wb_d1.save(str(self.saida_xlsx))
+            wb_d1.close()
+
+            # 3. Sobe o Dia 2 (2026-06-02)
+            total_d2 = processar_fluxo_seco(
+                caminho_csv=csv_dia2,
+                saida_xlsx=self.saida_xlsx,
+                silencioso=True,
+                triagem_db_path=self.db_triagem,
+                cep_db_path=self.db_cep,
+                template_path=self.template_xlsx,
+            )
+            self.assertEqual(total_d2, 5, "Todos os 5 protocolos devem permanecer na planilha ativa.")
+
+            # 4. Verifica se as modificações do Dia 1 permaneceram intactas na planilha gerada no Dia 2
+            wb_d2 = openpyxl.load_workbook(str(self.saida_xlsx))
+            ws_d2 = wb_d2["Controle VRE"]
+            self.assertEqual(ws_d2.max_row, 7)  # 2 linhas de cabeçalho + 5 registros
+
+            # Mapeia linhas por ProtocoloLicenca (Coluna 13)
+            linhas_por_lic = {}
+            for r in range(3, ws_d2.max_row + 1):
+                lic = ws_d2.cell(row=r, column=13).value
+                linhas_por_lic[lic] = r
+
+            self.assertIn("LIC_D1_1", linhas_por_lic)
+            self.assertIn("LIC_D1_2", linhas_por_lic)
+            self.assertIn("LIC_D2_1", linhas_por_lic)
+            self.assertIn("LIC_D2_INDEF", linhas_por_lic)
+            self.assertIn("LIC_PASSADO_INDEF", linhas_por_lic)
+
+            r_d1_1 = linhas_por_lic["LIC_D1_1"]
+            self.assertEqual(ws_d2.cell(row=r_d1_1, column=2).value, "Deferido")
+            self.assertEqual(ws_d2.cell(row=r_d1_1, column=3).value, "Fiscal_Gama")
+            self.assertEqual(ws_d2.cell(row=r_d1_1, column=4).value, "Noturno entregue")
+            self.assertEqual(ws_d2.cell(row=r_d1_1, column=6).value, "18/06/2026")
+            self.assertEqual(ws_d2.cell(row=r_d1_1, column=10).value, "Sim")
+            self.assertEqual(ws_d2.cell(row=r_d1_1, column=11).value, "2026/99999")
+
+            r_d1_2 = linhas_por_lic["LIC_D1_2"]
+            self.assertEqual(ws_d2.cell(row=r_d1_2, column=2).value, "Em Andamento")
+            self.assertEqual(ws_d2.cell(row=r_d1_2, column=3).value, "Fiscal_Delta")
+            self.assertEqual(ws_d2.cell(row=r_d1_2, column=4).value, "Diurno Livre")
+            self.assertIn(ws_d2.cell(row=r_d1_2, column=6).value, ("", None))
+            self.assertEqual(ws_d2.cell(row=r_d1_2, column=7).value, "099988800")
+            self.assertEqual(ws_d2.cell(row=r_d1_2, column=8).value, "CENTRO")
+            self.assertEqual(ws_d2.cell(row=r_d1_2, column=11).value, "OS-1234")
+
+            # Verifica que novos registros do Dia 2 vêm com Coluna F (6) vazia
+            self.assertIn(ws_d2.cell(row=linhas_por_lic["LIC_D2_1"], column=6).value, ("", None))
+
+            # Verifica que tanto o INDEFERIDO novo quanto o INDEFERIDO passado estão sem Tipo de Serviço e sem Restrição
+            for lic_indef in ("LIC_D2_INDEF", "LIC_PASSADO_INDEF"):
+                r_ind = linhas_por_lic[lic_indef]
+                self.assertIn(ws_d2.cell(row=r_ind, column=4).value, ("", None))
+                self.assertIn(ws_d2.cell(row=r_ind, column=5).value, ("", None))
+                self.assertIn(ws_d2.cell(row=r_ind, column=6).value, ("", None))
+
+            wb_d2.close()
+
+        finally:
+            cfg.TRIAGEM_DB_PATH = orig_triagem
+            cfg.CEP_DB_PATH = orig_cep
+            cfg.TEMPLATE_XLSX_PATH = orig_template
+            cfg.OUTPUT_XLSX_PATH = orig_saida
+
 
 if __name__ == "__main__":
     unittest.main()

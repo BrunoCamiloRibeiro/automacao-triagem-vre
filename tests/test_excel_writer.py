@@ -106,6 +106,7 @@ class TestExcelWriter(unittest.TestCase):
                         "Cep": "15081490",
                         "Iptu": "0554051005",
                         "Data": "16/05/2026",
+                        "DataCol6": "20/05/2026",
                     }
                 ),
             },
@@ -124,27 +125,29 @@ class TestExcelWriter(unittest.TestCase):
         self.assertEqual(ws.max_column, 32)
         self.assertEqual(ws.freeze_panes, "A3")
 
-        # Linha 3 (Noturno ativo, status PENDENTE deve ficar vazio)
+        # Linha 3 (Noturno ativo, status PENDENTE deve ficar vazio, Coluna F vazia por padrão)
         self.assertEqual(ws.cell(row=3, column=1).value, 1)  # Seq 1
         self.assertIn(ws.cell(row=3, column=2).value, ("", None)) # Status vazio (não distribuído / pendente)
         self.assertEqual(ws.cell(row=3, column=3).value, "Fiscal_Alfa")
         self.assertEqual(ws.cell(row=3, column=4).value, "Noturno")
         self.assertEqual(ws.cell(row=3, column=5).value, "Noturno")    # Nova coluna Restrição
-        self.assertEqual(ws.cell(row=3, column=6).value, "15/05/2026") # Data
+        self.assertIn(ws.cell(row=3, column=6).value, ("", None))      # Coluna F (Data) vazia por padrão
         self.assertEqual(ws.cell(row=3, column=7).value, "0307968000") # IPTU
         self.assertEqual(ws.cell(row=3, column=8).value, "CENTRAL")     # ÁREA
         self.assertEqual(ws.cell(row=3, column=9).value, "RUA AIMORES, 287 - VILA ANCHIETA")
+        self.assertEqual(ws.cell(row=3, column=14).value, "15/05/2026") # Coluna N (Data VRE)
 
-        # Linha 4 (Restrição ativa, tem dono 'Fiscal_Beta' e não é noturno -> Tipo de Serviço = 'Diurno Livre')
+        # Linha 4 (Restrição ativa, tem dono 'Fiscal_Beta' e não é noturno -> Tipo de Serviço = 'Diurno Livre', DataCol6 preenchida a mão)
         self.assertEqual(ws.cell(row=4, column=1).value, 2)  # Seq 2
         self.assertIn(ws.cell(row=4, column=2).value, ("", None)) # Status vazio (distribuído)
         self.assertEqual(ws.cell(row=4, column=3).value, "Fiscal_Beta")
         self.assertEqual(ws.cell(row=4, column=4).value, "Diurno Livre")
         self.assertEqual(ws.cell(row=4, column=5).value, "Com Restrição") # Nova coluna Restrição
-        self.assertEqual(ws.cell(row=4, column=6).value, "16/05/2026")
+        self.assertEqual(ws.cell(row=4, column=6).value, "20/05/2026")    # Coluna F preenchida a mão
         self.assertEqual(ws.cell(row=4, column=7).value, "0554051005")
         self.assertEqual(ws.cell(row=4, column=8).value, "HB")
         self.assertEqual(ws.cell(row=4, column=9).value, "AV MARIO ANDREAZZA, 181 SALA 1 - JARDIM SÃO MARCO")
+        self.assertEqual(ws.cell(row=4, column=14).value, "16/05/2026")   # Coluna N (Data VRE)
 
         # Formatação Condicional presente (15 regras, incluindo Sem Restrição amarelo)
         self.assertEqual(len(ws.conditional_formatting), 1)

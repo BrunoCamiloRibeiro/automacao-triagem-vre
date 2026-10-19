@@ -55,6 +55,30 @@ from src.core.normalizer import (
 # Cache em memória do último hash gerado pelo sistema para cada caminho de planilha
 _ULTIMO_HASH_GERADO: dict[str, str] = {}
 
+# Chave de migração única para limpar as datas anteriores preenchidas automaticamente na Coluna F (Data)
+_MIGRACAO_LIMPEZA_COL_F_KEY = "limpeza_unica_data_col_f_v15"
+
+
+def _migracao_limpeza_col_f_concluida(triagem_conn: sqlite3.Connection | None) -> bool:
+    """Verifica se a limpeza única da coluna Data (F) já foi executada no banco."""
+    if triagem_conn is None:
+        return False
+    try:
+        cur = triagem_conn.cursor()
+        cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='controle_migracoes';"
+        )
+        if not cur.fetchone():
+            return False
+        cur.execute(
+            "SELECT 1 FROM controle_migracoes WHERE chave = ? LIMIT 1;",
+            (_MIGRACAO_LIMPEZA_COL_F_KEY,),
+        )
+        return cur.fetchone() is not None
+    except Exception:
+        return False
+
+
 # Definição oficial das 32 colunas da planilha de trabalho ativa (31 originais + nova coluna única de Restrição)
 COLUNAS_CABECALHO = [
     ("Número ordem ", 17.43),
@@ -296,6 +320,7 @@ def sincronizar_planilha_ativa_com_banco(
         ceps_para_mapear: list[tuple[str, str, str]] = []
         meses_ativos_detectados: set[str] = set()
 
+        limpeza_col_f_concluida = _migracao_limpeza_col_f_concluida(triagem_conn)
         data_hoje = datetime.date.today().isoformat()
 
         for idx_linha, row in enumerate(linhas_planilha[2:], start=3):
@@ -311,7 +336,11 @@ def sincronizar_planilha_ativa_com_banco(
             fiscal_excel = _col(3)
             tipo_servico_excel = _col(4)
             restricao_excel = _col(5)
-            data_col6 = _col(6)
+            val_col6_raw = row[5] if len(row) >= 6 else None
+            if isinstance(val_col6_raw, (datetime.date, datetime.datetime)):
+                data_col6 = val_col6_raw.strftime("%d/%m/%Y")
+            else:
+                data_col6 = _col(6)
             iptu_col7 = _col(7)
             area_excel = _col(8)
             endereco_excel = _col(9)
@@ -476,7 +505,7 @@ def sincronizar_planilha_ativa_com_banco(
             cnaes_lic_final = cnaes_lic_excel or (reg_ant.get("cnaes_licenciadas") if reg_ant else "") or ""
 
             extras["Data"] = data_vre_final
-            if data_col6 and data_col6 != data_vre_final:
+            if limpeza_col_f_concluida and data_col6:
                 extras["DataCol6"] = data_col6
             else:
                 extras.pop("DataCol6", None)
@@ -644,13 +673,20 @@ def sincronizar_planilha_ativa_com_banco(
             cep_conn.close()
 
 
-def limpar_indeferidos_e_normalizar_backlog(triagem_conn: sqlite3.Connection) -> int:
+def limpar_indeferidos_e_normalizar_backlog(
+    triagem_conn: sqlite3.Connection,
+    executar_migracao_col_f: bool = True,
+) -> int:
     """Garante para todos os registros do backlog (inclusive os passados):
     1. Quando está indeferido (SituacaoPostura == 'INDEFERIDO' ou Status == 'Indeferido'),
        limpa Tipo de Serviço e Restrição (somente quando indeferido).
     2. Quando não está indeferido e tem dono (fiscal atribuído):
        se não é noturno e está com classificação livre sem dono, muda para 'Diurno Livre' (ou 'Noturno' se noturno).
+    3. Executa uma única vez a limpeza das datas anteriores da Coluna F (DataCol6),
+       preservando daí para frente qualquer data preenchida manualmente pelo operador.
     """
+    precisa_limpar_col_f = executar_migracao_col_f and not _migracao_limpeza_col_f_concluida(triagem_conn)
+
     cur = triagem_conn.cursor()
     cur.execute(
         """
@@ -674,6 +710,11 @@ def limpar_indeferidos_e_normalizar_backlog(triagem_conn: sqlite3.Connection) ->
         except Exception:
             extras = {}
 
+        mudou_json = False
+        if precisa_limpar_col_f and "DataCol6" in extras:
+            extras.pop("DataCol6", None)
+            mudou_json = True
+
         postura_up = str(extras.get("SituacaoPostura") or "").strip().upper()
         status_ex_up = str(extras.get("Status") or "").strip().upper()
         eh_indeferido = (
@@ -683,7 +724,6 @@ def limpar_indeferidos_e_normalizar_backlog(triagem_conn: sqlite3.Connection) ->
         )
 
         if eh_indeferido:
-            mudou_json = False
             if "RestricaoCustom" in extras:
                 extras.pop("RestricaoCustom", None)
                 mudou_json = True
@@ -695,6 +735,7 @@ def limpar_indeferidos_e_normalizar_backlog(triagem_conn: sqlite3.Connection) ->
                 atualizacoes.append(("", novo_json, prot_lic))
         else:
             tem_dono = bool(fisc and fisc.upper() not in ("NÃO INFORMADO", "NAO INFORMADO", "PENDENTE"))
+            novo_ts = ts_atual
             if tem_dono and (
                 not ts_atual
                 or ts_atual in (
@@ -706,20 +747,38 @@ def limpar_indeferidos_e_normalizar_backlog(triagem_conn: sqlite3.Connection) ->
                 )
             ):
                 novo_ts = "Noturno" if (flag_n == 1 or ts_atual == "Noturno Livre") else "Diurno Livre"
-                if novo_ts != ts_atual:
-                    atualizacoes.append((novo_ts, raw_json, prot_lic))
+            if novo_ts != ts_atual or mudou_json:
+                novo_json = json.dumps(extras, ensure_ascii=False) if mudou_json else raw_json
+                atualizacoes.append((novo_ts, novo_json, prot_lic))
 
-    if atualizacoes:
+    if atualizacoes or precisa_limpar_col_f:
         with db_transaction(triagem_conn) as t_cur:
-            t_cur.executemany(
-                """
-                UPDATE vre_backlog
-                SET tipo_servico = ?,
-                    dados_extras_json = ?
-                WHERE protocolo_licenca = ?;
-                """,
-                atualizacoes,
-            )
+            if atualizacoes:
+                t_cur.executemany(
+                    """
+                    UPDATE vre_backlog
+                    SET tipo_servico = ?,
+                        dados_extras_json = ?
+                    WHERE protocolo_licenca = ?;
+                    """,
+                    atualizacoes,
+                )
+            if precisa_limpar_col_f:
+                t_cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS controle_migracoes (
+                        chave TEXT PRIMARY KEY,
+                        executado_em DATETIME DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """
+                )
+                t_cur.execute(
+                    """
+                    INSERT OR IGNORE INTO controle_migracoes (chave, executado_em)
+                    VALUES (?, CURRENT_TIMESTAMP);
+                    """,
+                    (_MIGRACAO_LIMPEZA_COL_F_KEY,),
+                )
     return len(atualizacoes)
 
 
@@ -937,9 +996,9 @@ def gerar_planilha_trabalho(
         cep_bruto = str(extras.get("Cep", "") or "")
         cep4 = cep_bruto[:5] if len(cep_bruto) >= 5 else cep_bruto
 
-        # Data do VRE (usar data do VRE não a colocada, preservando DataCol6 caso tenha sido editada manualmente)
+        # Coluna N (14): Data oficial do VRE. Coluna F (6): vazia por padrão, preenchida apenas a mão (DataCol6).
         data_vre = extras.get("Data", "") or reg.get("data_importacao", "")
-        data_col6 = extras.get("DataCol6") or data_vre
+        data_col6 = extras.get("DataCol6") or ""
 
         iptu_val = extras.get("Iptu", "") or extras.get("IPTU", "") or ""
 
