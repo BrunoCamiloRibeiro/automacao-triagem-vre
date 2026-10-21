@@ -97,9 +97,10 @@ class TestBateriaCenarios(unittest.TestCase):
 
         wb = openpyxl.load_workbook(self.saida_xlsx)
         ws = wb.active
-        # Protocolo da AFONSO REIS (CNPJ 61.017.032/0001-94)
+        # Protocolo com fiscal histórico e não noturno -> deve receber fiscal e 'Diurno Livre'
         fiscal_atribuido = ws.cell(3, 3).value
         self.assertTrue(bool(fiscal_atribuido), "O fiscal histórico deve ser preenchido.")
+        self.assertEqual(ws.cell(3, 4).value, "Diurno Livre")
 
     def test_03_cenario_noturno_e_heranca(self):
         """Valida que restaurantes e bares herdam a marcação noturna em Tipo de Serviço e Restrição."""

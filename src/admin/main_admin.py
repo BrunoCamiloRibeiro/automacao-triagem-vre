@@ -1,12 +1,21 @@
 """Executável Administrativo GUI (config_vre.exe).
 
-Interface gráfica nativa em Tkinter para:
-1. Aba 1 - Busca de Histórico: Pesquisa ágil de fiscais por CNPJ, Razão Social ou Fiscal,
-   com listagem padrão dos atendimentos mais recentes e importação multithread sem travamento.
-2. Aba 2 - Gestão de CEP x Área: Cadastro, edição e visualização de correlações com
-   filtros avançados por Área e Bairro, além de ordenação interativa por colunas.
-3. Aba 3 - Arquivamento de Competências: Monitoramento de competências mensais,
-   controle de visibilidade (Ativo/Arquivado) e geração da planilha oficial com backup datado.
+Interface gráfica corporativa em Tkinter nativo para gestão operacional da SMAURB:
+1. Aba 1 - Busca de Histórico:
+   - Pesquisa ágil de atendimentos por CNPJ, Razão Social ou Fiscal titular.
+   - Listagem em tempo real dos atendimentos mais recentes.
+   - Importação pontual ou em lote de planilhas históricas via thread em background com modal de progresso.
+2. Aba 2 - Gestão de CEP x Área:
+   - Mapeamento, edição e exclusão de correlações no banco satélite `cep_areas.db`.
+   - Filtros combinados por Área Fiscal e Bairro de referência.
+   - Painel de CEPs pendentes ordenados pelo volume de ocorrências.
+3. Aba 3 - Arquivamento de Competências:
+   - Painel de controle de meses de competência (visibilidade: Ativo vs Arquivado).
+   - KPIs gerenciais do backlog (total, pendentes, distribuídos, finalizados, visíveis).
+   - Botão atômico de aplicação com backup preventivo datado e regeneração da planilha ativa.
+4. Modo CLI / Manutenção:
+   - Suporte a comandos de terminal (`--cli`, `--buscar`, `--arquivar`, `--mapear-cep`, etc.)
+     para ambientes headless ou scripts automatizados.
 """
 
 from __future__ import annotations
@@ -47,7 +56,7 @@ from src.core.historico_importer import (
 )
 from src.core.normalizer import formatar_cep, formatar_cnpj, normalizar_cep, normalizar_cnpj
 
-# Tenta carregar Tkinter defensivamente (em Windows é padrão; em Linux headless pode estar ausente)
+# Carregamento seguro do Tkinter para tolerar ambientes headless (ex: servidores Linux de CI/CD)
 try:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
@@ -57,19 +66,24 @@ except ImportError:
 
 
 class PainelAdminVRE:
-    """Janela principal do Executável Administrativo."""
+    """Janela principal do Executável Administrativo da SMAURB / Inspetoria Fiscal."""
 
     def __init__(self, root: tk.Tk) -> None:
+        """Inicializa a interface gráfica, estilos, abas e carrega os dados iniciais.
+
+        Args:
+            root: Instância principal da janela Tkinter (`tk.Tk`).
+        """
         self.root = root
         self.root.title("SMAURB - Painel Administrativo VRE & Fiscais")
         self.root.geometry("1060x700")
         self.root.minsize(900, 580)
 
-        # Referências de imagens para prevenir garbage collection do Tkinter
+        # Referências de imagens para prevenir garbage collection precoce pelo Tkinter
         self.img_logo: Any = None
         self.img_header: Any = None
 
-        # Configuração de Estilo ttk
+        # Configuração de Estilo ttk profissional
         self.style = ttk.Style()
         try:
             self.style.theme_use("clam")
@@ -81,7 +95,7 @@ class PainelAdminVRE:
         self.atualizar_tudo()
 
     def _carregar_logo(self) -> None:
-        """Carrega o brasão de São José do Rio Preto para o ícone e cabeçalho."""
+        """Carrega o brasão de São José do Rio Preto para o ícone e cabeçalho da janela."""
         candidatos = [
             PROJECT_ROOT / "templates" / "logo_rio_preto.png",
             PROJECT_ROOT / "fbuild" / "Configurações" / "templates" / "logo_rio_preto.png",
@@ -101,7 +115,8 @@ class PainelAdminVRE:
                     pass
 
     def _criar_widgets(self) -> None:
-        # Cabeçalho Institucional
+        """Constrói a hierarquia de widgets: cabeçalho azul, abas do notebook e status bar."""
+        # Cabeçalho Institucional Azul SMAURB (#2C3E50)
         header_frame = tk.Frame(self.root, bg="#2C3E50", height=54)
         header_frame.pack(fill="x", side="top")
 
@@ -120,7 +135,7 @@ class PainelAdminVRE:
         )
         lbl_titulo.pack(side="left", padx=5)
 
-        # Notebook com Abas
+        # Notebook com as 3 Abas Principais
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=10)
 
@@ -152,9 +167,6 @@ class PainelAdminVRE:
         )
         self.lbl_status.pack(fill="x", side="bottom")
 
-    # =========================================================================
-    # DIÁLOGO DE CARREGAMENTO / LOADING MODAL (NÃO CONGELA A TELA)
-    # =========================================================================
     def _executar_com_loading(
         self,
         target_fn,
@@ -163,7 +175,19 @@ class PainelAdminVRE:
         on_sucesso=None,
         on_erro=None,
     ) -> None:
-        """Executa uma função pesada em thread de background com modal de progresso indeterminada."""
+        """Executa uma função pesada em thread de background com modal de progresso indeterminada.
+
+        Garante que a interface gráfica permaneça fluida e responsiva durante operações de I/O
+        intensivo (leitura de planilhas gigantes, sincronização do Excel ou geração de relatórios).
+        A sincronização com a thread principal do Tkinter é realizada via `root.after(0, ...)`.
+
+        Args:
+            target_fn: Função a ser executada na thread de trabalho.
+            titulo: Título da janela modal de carregamento.
+            mensagem: Texto explicativo exibido para o usuário.
+            on_sucesso: Callback opcional chamado com o resultado de `target_fn`.
+            on_erro: Callback opcional chamado caso `target_fn` levante exceção.
+        """
         top = tk.Toplevel(self.root)
         top.title(titulo)
         top.geometry("460x170")
@@ -237,16 +261,22 @@ class PainelAdminVRE:
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
 
-    # =========================================================================
-    # RECURSO DE ORDENAÇÃO POR CLIQUE NO CABEÇALHO DA TABELA
-    # =========================================================================
     def ordenar_treeview(self, tree: ttk.Treeview, col: str, reverse: bool = False) -> None:
-        """Ordena os itens da Treeview numericamente ou alfabeticamente ao clicar no cabeçalho."""
+        """Ordena os itens da Treeview numericamente ou alfabeticamente ao clicar no cabeçalho.
+
+        Permite ordenação bi-direcional inteligente (crescente/decrescente), convertendo
+        valores numéricos (ex: totais, pendências) para ordenação matemática e strings para
+        ordenação lexicográfica em caixa baixa.
+
+        Args:
+            tree: Instância do widget `ttk.Treeview`.
+            col: Identificador da coluna clicada.
+            reverse: Se True, inverte a ordem de classificação.
+        """
         itens = [(tree.set(k, col), k) for k in tree.get_children("")]
 
         def _converter_chave(val: str) -> Any:
             v = str(val).strip()
-            # Tenta conversão numérica
             try:
                 v_num = v.replace(".", "").replace(",", ".")
                 return (0, float(v_num))
@@ -259,13 +289,14 @@ class PainelAdminVRE:
         for idx, (_, k) in enumerate(itens):
             tree.move(k, "", idx)
 
-        # Inverte a ordem para o próximo clique
+        # Inverte a ordem para o próximo clique do usuário
         tree.heading(col, command=lambda: self.ordenar_treeview(tree, col, not reverse))
 
     # =========================================================================
-    # ABA 1: BUSCA DE HISTÓRICO
+    # ABA 1: BUSCA DE HISTÓRICO DE FISCAIS
     # =========================================================================
     def _construir_aba_historico(self) -> None:
+        """Constrói os componentes da Aba 1 (Filtros, Botões de Importação e Tabela de Atendimentos)."""
         top_frame = ttk.LabelFrame(self.tab_historico, text=" Pesquisa de Atendimentos Anteriores ", padding=10)
         top_frame.pack(fill="x", padx=10, pady=10)
 
@@ -377,6 +408,7 @@ class PainelAdminVRE:
         self.lbl_status.config(text=f"Exibindo os {len(resultados)} atendimentos mais recentes gravados no sistema.")
 
     def _limpar_busca_hist(self) -> None:
+        """Limpa filtros e campos de pesquisa do histórico."""
         self.ent_busca_hist.delete(0, tk.END)
         if hasattr(self, "cb_filtro_fiscal") and self.cb_filtro_fiscal["values"]:
             self.cb_filtro_fiscal.current(0)
@@ -384,6 +416,7 @@ class PainelAdminVRE:
         self.lbl_status.config(text="Filtros limpos. Exibindo atendimentos recentes.")
 
     def pesquisar_historico(self) -> None:
+        """Executa a busca de atendimentos e atualiza a Treeview."""
         termo = self.ent_busca_hist.get().strip()
         fisc = self.cb_filtro_fiscal.get().strip() if hasattr(self, "cb_filtro_fiscal") else ""
 
@@ -392,7 +425,7 @@ class PainelAdminVRE:
 
         resultados = buscar_historico_fiscais(termo_busca=termo, fiscal_filtro=fisc, limit=100)
         if not resultados:
-            self.lbl_status.config(text=f"Nenhum atendimento encontrado para os filtros informados.")
+            self.lbl_status.config(text="Nenhum atendimento encontrado para os filtros informados.")
             messagebox.showinfo("Pesquisa", "Nenhum atendimento localizado para os critérios informados.")
             return
 
@@ -411,7 +444,7 @@ class PainelAdminVRE:
         self.lbl_status.config(text=f"{len(resultados)} atendimento(s) encontrado(s).")
 
     def importar_pasta_planilhas(self) -> None:
-        """Importa todas as planilhas depositadas em 'Planilhas anteriores/' em thread separada com loading."""
+        """Importa todas as planilhas da pasta 'Planilhas anteriores/' em thread separada."""
         def _executar():
             return escanear_e_importar_planilhas_antigas(forcar=True)
 
@@ -483,6 +516,7 @@ class PainelAdminVRE:
     # ABA 2: GESTÃO DE CEP X ÁREA
     # =========================================================================
     def _construir_aba_cep(self) -> None:
+        """Constrói os componentes da Aba 2: Tabela de CEPs Mapeados, Formulário e Tabela de Pendências."""
         paned = ttk.PanedWindow(self.tab_cep, orient="horizontal")
         paned.pack(fill="both", expand=True, padx=10, pady=10)
 
@@ -503,7 +537,7 @@ class PainelAdminVRE:
         self.ent_filtro_cep.pack(side="left", padx=3)
         self.ent_filtro_cep.bind("<KeyRelease>", lambda e: self.carregar_ceps_mapeados())
 
-        # Dropdowns solicitados: Filtrar por Área e Bairro
+        # Dropdowns: Filtrar por Área e Bairro
         ttk.Label(busca_cep_frame, text="Área:").pack(side="left", padx=(8, 3))
         self.cb_filtro_area = ttk.Combobox(busca_cep_frame, state="readonly", width=14)
         self.cb_filtro_area.pack(side="left", padx=3)
@@ -635,6 +669,7 @@ class PainelAdminVRE:
             pass
 
     def _limpar_filtros_cep(self) -> None:
+        """Limpa filtros e campos de pesquisa de CEP."""
         self.ent_filtro_cep.delete(0, tk.END)
         if hasattr(self, "cb_filtro_area") and self.cb_filtro_area["values"]:
             self.cb_filtro_area.current(0)
@@ -643,6 +678,7 @@ class PainelAdminVRE:
         self.carregar_ceps_mapeados()
 
     def _ao_selecionar_cep_mapeado(self, event: Any) -> None:
+        """Preenche o formulário com o CEP mapeado selecionado na tabela."""
         sel = self.tree_cep.selection()
         if not sel:
             return
@@ -655,6 +691,7 @@ class PainelAdminVRE:
             self.ent_form_bairro.insert(0, vals[2])
 
     def _ao_selecionar_cep_pendente(self, event: Any) -> None:
+        """Preenche o formulário com o CEP pendente selecionado na tabela."""
         sel = self.tree_pend.selection()
         if not sel:
             return
@@ -666,11 +703,13 @@ class PainelAdminVRE:
             self.ent_form_bairro.insert(0, vals[2])
 
     def _limpar_form_cep(self) -> None:
+        """Limpa os campos do formulário de CEP."""
         self.ent_form_cep.delete(0, tk.END)
         self.cb_form_area.set("")
         self.ent_form_bairro.delete(0, tk.END)
 
     def carregar_ceps_mapeados(self) -> None:
+        """Carrega a tabela de CEPs mapeados respeitando os filtros ativos."""
         termo = self.ent_filtro_cep.get().strip()
         area_f = self.cb_filtro_area.get().strip() if hasattr(self, "cb_filtro_area") else ""
         bairro_f = self.cb_filtro_bairro.get().strip() if hasattr(self, "cb_filtro_bairro") else ""
@@ -696,6 +735,7 @@ class PainelAdminVRE:
             )
 
     def carregar_ceps_pendentes(self) -> None:
+        """Carrega a tabela de CEPs pendentes."""
         for item in self.tree_pend.get_children():
             self.tree_pend.delete(item)
 
@@ -712,6 +752,7 @@ class PainelAdminVRE:
             )
 
     def salvar_cep_form(self) -> None:
+        """Salva ou atualiza a correlação de CEP x Área preenchida no formulário."""
         cep_val = self.ent_form_cep.get().strip()
         area_val = self.cb_form_area.get().strip().upper()
         bairro_val = self.ent_form_bairro.get().strip()
@@ -748,6 +789,7 @@ class PainelAdminVRE:
             messagebox.showerror("Erro ao Salvar", str(e))
 
     def excluir_cep_form(self) -> None:
+        """Exclui a correlação de CEP informada no formulário."""
         cep_val = self.ent_form_cep.get().strip()
         cep_limpo = normalizar_cep(cep_val)
         if not cep_limpo:
@@ -765,6 +807,7 @@ class PainelAdminVRE:
     # ABA 3: ARQUIVAMENTO DE COMPETÊNCIAS
     # =========================================================================
     def _construir_aba_arquivamento(self) -> None:
+        """Constrói os componentes da Aba 3 (KPIs, Tabela de Competências e Botão de Aplicação)."""
         info_frame = ttk.LabelFrame(self.tab_arquivamento, text=" Controle de Visibilidade e Arquivamento por Mês ", padding=10)
         info_frame.pack(fill="x", padx=10, pady=(10, 5))
 
@@ -874,6 +917,7 @@ class PainelAdminVRE:
         btn_atualizar.pack(side="right", padx=5)
 
     def carregar_lotes_arquivamento(self) -> None:
+        """Carrega e calcula KPIs do backlog e preenche a tabela de competências."""
         stats = obter_estatisticas_gerais()
         self.lbl_kpi_total.config(text=f"Backlog Total: {stats['total_backlog']}")
         self.lbl_kpi_visiveis.config(text=f"Ativos na Planilha: {stats['protocolos_ativos_visiveis']}")
@@ -902,6 +946,7 @@ class PainelAdminVRE:
             )
 
     def alternar_status_selecionado(self) -> None:
+        """Alterna o status do mês selecionado entre Ativo e Arquivado."""
         sel = self.tree_lotes.selection()
         if not sel:
             messagebox.showwarning("Aviso", "Selecione um mês de competência na tabela.")
@@ -917,6 +962,7 @@ class PainelAdminVRE:
         )
 
     def arquivar_selecionado(self) -> None:
+        """Marca o mês selecionado como Arquivado."""
         sel = self.tree_lotes.selection()
         if not sel:
             messagebox.showwarning("Aviso", "Selecione um mês de competência na tabela.")
@@ -931,6 +977,7 @@ class PainelAdminVRE:
         )
 
     def reativar_selecionado(self) -> None:
+        """Reativa o mês selecionado (marca como Ativo / Visível)."""
         sel = self.tree_lotes.selection()
         if not sel:
             messagebox.showwarning("Aviso", "Selecione um mês de competência na tabela.")
@@ -945,6 +992,7 @@ class PainelAdminVRE:
         )
 
     def aplicar_alteracoes_planilha(self) -> None:
+        """Aplica reorganização de competências, gera backup e recria a planilha ativa."""
         if not messagebox.askyesno(
             "Aplicar Alterações e Atualizar Planilha",
             "Deseja atualizar a planilha de trabalho ativa?\n\n"
@@ -992,7 +1040,11 @@ class PainelAdminVRE:
 
 
 def executar_modo_cli(args: argparse.Namespace) -> None:
-    """Modo texto/CLI para administração quando GUI não puder ser aberta."""
+    """Modo texto/CLI para administração quando GUI não puder ser aberta.
+
+    Args:
+        args: Argumentos parseados via `argparse`.
+    """
     if getattr(args, "buscar", None):
         termo = args.buscar.strip()
         print(f"[*] Pesquisando histórico para: '{termo}'...")
@@ -1026,7 +1078,7 @@ def executar_modo_cli(args: argparse.Namespace) -> None:
         return
 
     if getattr(args, "aplicar", False):
-        print(f"[*] Aplicando alterações e gerando nova planilha de trabalho...")
+        print("[*] Aplicando alterações e gerando nova planilha de trabalho...")
         res = aplicar_reorganizacao_planilha()
         print(f"    [✓] {res['mensagem']}")
         return

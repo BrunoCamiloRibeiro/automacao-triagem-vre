@@ -8,13 +8,12 @@ Implementa a rotina institucional de Arquivamento por Mês de Competência:
   2. Gera uma nova planilha ativa com todos os meses selecionados como ativos,
      juntamente com quaisquer novos registros recebidos via CSV.
   3. Os registros permanecem sempre íntegros e preservados no banco SQLite (vre_backlog).
-- Pesquisa multi-critério de fiscais históricos por CNPJ ou Razão Social.
+- Pesquisa multi-critério de fiscais históricos por CNPJ ou Razão Social com proteção contra injeção de wildcards.
 """
 
 from __future__ import annotations
 
 import datetime
-import os
 import shutil
 import sqlite3
 from pathlib import Path
@@ -38,7 +37,19 @@ from src.core.normalizer import formatar_cnpj, normalizar_cnpj
 
 
 def garantir_tabela_controle(conn: sqlite3.Connection) -> None:
-    """Garante que a tabela controle_competencias exista e esteja sincronizada."""
+    """Garante que a tabela controle_competencias e seus índices existam no banco central.
+
+    Sincroniza automaticamente quaisquer competências identificadas em `vre_backlog`
+    que ainda não tenham sido cadastradas no controle, definindo-as inicialmente
+    como ativas (`arquivado = 0`).
+
+    Args:
+        conn: Conexão SQLite ativa com `triagem_vre.db`.
+
+    Complexity:
+        Tempo: O(C) onde C é o número de competências distintas no backlog.
+        Espaço: O(1).
+    """
     cur = conn.cursor()
     cur.execute(
         """
@@ -62,7 +73,17 @@ def garantir_tabela_controle(conn: sqlite3.Connection) -> None:
 
 
 def sincronizar_competencias(conn: sqlite3.Connection | None = None) -> None:
-    """Sincroniza os meses do backlog com a tabela controle_competencias."""
+    """Sincroniza os meses do backlog com a tabela controle_competencias.
+
+    Função utilitária exposta para invocação manual ou pré-carga de interfaces.
+
+    Args:
+        conn: Conexão SQLite opcional. Se None, gerencia ciclo de vida próprio.
+
+    Complexity:
+        Tempo: O(C).
+        Espaço: O(1).
+    """
     close_conn = False
     if conn is None:
         conn = get_triagem_db()
@@ -76,7 +97,25 @@ def sincronizar_competencias(conn: sqlite3.Connection | None = None) -> None:
 
 
 def obter_estatisticas_gerais(conn: sqlite3.Connection | None = None) -> dict[str, int]:
-    """Retorna contadores gerais do backlog, competências e histórico."""
+    """Retorna contadores consolidados do backlog, competências e histórico de fiscais.
+
+    Calcula métricas agregadas para o dashboard da interface gráfica:
+    - Total de protocolos no backlog.
+    - Protocolos pendentes, distribuídos e finalizados.
+    - Total de registros em `historico_fiscais`.
+    - Meses cadastrados, ativos e arquivados.
+    - Protocolos que constam na planilha de trabalho ativa atual.
+
+    Args:
+        conn: Conexão SQLite opcional.
+
+    Returns:
+        dict[str, int]: Dicionário com 9 contadores inteiros fundamentais.
+
+    Complexity:
+        Tempo: O(1) a O(N) com consultas otimizadas por índice.
+        Espaço: O(1).
+    """
     close_conn = False
     if conn is None:
         conn = get_triagem_db()
@@ -140,7 +179,21 @@ def obter_estatisticas_gerais(conn: sqlite3.Connection | None = None) -> dict[st
 def listar_competencias_status(
     conn: sqlite3.Connection | None = None,
 ) -> list[dict[str, Any]]:
-    """Lista todos os meses de competência e sua condição de arquivamento (visibilidade)."""
+    """Lista todos os meses de competência e sua condição de arquivamento (visibilidade).
+
+    Retorna tabela agregada com totais, pendentes, distribuídos, finalizados
+    e percentual de conclusão de cada lote mensal.
+
+    Args:
+        conn: Conexão SQLite opcional.
+
+    Returns:
+        list[dict[str, Any]]: Lista de competências ordenadas decrescentemente (mais recentes primeiro).
+
+    Complexity:
+        Tempo: O(C * log C) onde C é o número de meses cadastrados.
+        Espaço: O(C).
+    """
     close_conn = False
     if conn is None:
         conn = get_triagem_db()
@@ -166,7 +219,7 @@ def listar_competencias_status(
             ORDER BY c.mes_competencia DESC;
             """
         )
-        linhas = []
+        linhas: list[dict[str, Any]] = []
         for r in cur.fetchall():
             tot = r["total"] or 0
             fin = r["finalizados"] or 0
@@ -187,7 +240,7 @@ def listar_competencias_status(
                     "pendentes": pend,
                     "distribuidos": dist,
                     "taxa_conclusao": round(taxa_conclusao, 1),
-                    "pode_arquivar": True,  # Qualquer mês pode ser arquivado/ocultado a critério do usuário
+                    "pode_arquivar": True,
                 }
             )
         return linhas
@@ -201,7 +254,20 @@ def definir_status_competencia(
     arquivado: bool,
     conn: sqlite3.Connection | None = None,
 ) -> bool:
-    """Define se uma competência deve estar arquivada (oculta) ou ativa (visível)."""
+    """Define se uma competência deve estar arquivada (oculta) ou ativa (visível).
+
+    Args:
+        mes_competencia: Mês no formato 'AAAA-MM' (ex: '2026-05').
+        arquivado: True para ocultar da planilha ativa, False para torná-lo visível.
+        conn: Conexão SQLite opcional.
+
+    Returns:
+        bool: True se a alteração foi persistida com sucesso, False se parâmetro inválido.
+
+    Complexity:
+        Tempo: O(1) de upsert indexado.
+        Espaço: O(1).
+    """
     comp_limpa = str(mes_competencia).strip()
     if not comp_limpa:
         return False
@@ -236,7 +302,19 @@ def alternar_status_competencia(
     mes_competencia: str,
     conn: sqlite3.Connection | None = None,
 ) -> bool:
-    """Alterna o status de arquivamento (Ativo <-> Arquivado) de um mês."""
+    """Alterna o status de arquivamento (Ativo <-> Arquivado) de um mês de competência.
+
+    Args:
+        mes_competencia: Mês a alternar (ex: '2026-06').
+        conn: Conexão SQLite opcional.
+
+    Returns:
+        bool: Novo estado de arquivamento (True = arquivado/oculto, False = ativo/visível).
+
+    Complexity:
+        Tempo: O(1).
+        Espaço: O(1).
+    """
     comp_limpa = str(mes_competencia).strip()
     if not comp_limpa:
         return False
@@ -276,9 +354,24 @@ def arquivar_competencia(
     forcar: bool = False,
     conn: sqlite3.Connection | None = None,
 ) -> tuple[int, str]:
-    """Marca a competência como arquivada (oculta da planilha de trabalho atual)
+    """Marca a competência como arquivada (oculta da planilha de trabalho atual).
 
-    e sincroniza atendimentos finalizados com fiscal para o histórico permanente.
+    Ações adicionais de integridade:
+    - Sincroniza todos os atendimentos com fiscal atribuído daquela competência
+      diretamente para `historico_fiscais`, garantindo que esses fiscais continuem
+      sendo reconhecidos automaticamente em futuros pedidos de mesmo CNPJ.
+
+    Args:
+        mes_competencia: Mês a arquivar.
+        forcar: Flag de compatibilidade retroativa.
+        conn: Conexão SQLite opcional.
+
+    Returns:
+        tuple[int, str]: Quantidade de protocolos arquivados e mensagem descritiva.
+
+    Complexity:
+        Tempo: O(P) onde P é o número de protocolos daquele mês.
+        Espaço: O(1).
     """
     comp_limpa = str(mes_competencia).strip()
     close_conn = False
@@ -326,7 +419,19 @@ def reativar_competencia(
     mes_competencia: str,
     conn: sqlite3.Connection | None = None,
 ) -> tuple[int, str]:
-    """Reativa a competência (passa a constar na planilha de trabalho atual)."""
+    """Reativa a competência (passa a constar na planilha de trabalho atual).
+
+    Args:
+        mes_competencia: Mês a reativar.
+        conn: Conexão SQLite opcional.
+
+    Returns:
+        tuple[int, str]: Código de sucesso (1 ou 0) e mensagem descritiva.
+
+    Complexity:
+        Tempo: O(1).
+        Espaço: O(1).
+    """
     comp_limpa = str(mes_competencia).strip()
     ok = definir_status_competencia(comp_limpa, arquivado=False, conn=conn)
     if ok:
@@ -337,7 +442,21 @@ def reativar_competencia(
 def fazer_backup_planilha_ativa(
     caminho_planilha: Path | str | None = None,
 ) -> Path | None:
-    """Gera cópia de segurança datada da planilha de trabalho ativa em /Planilhas anteriores."""
+    """Gera cópia de segurança datada da planilha de trabalho ativa em /Planilhas anteriores.
+
+    Utiliza `copy2` para manter os carimbos de tempo originais. Em caso de bloqueio temporário
+    (ex: planilha aberta pelo Excel do usuário), tenta cópia via streaming de bytes de baixo nível.
+
+    Args:
+        caminho_planilha: Caminho da planilha a copiar ou None para `OUTPUT_XLSX_PATH`.
+
+    Returns:
+        Path | None: Caminho do arquivo de backup criado ou None se origem inexistente/bloqueada.
+
+    Complexity:
+        Tempo: O(B) onde B é o tamanho do arquivo em bytes.
+        Espaço: O(1).
+    """
     p_origem = Path(caminho_planilha) if caminho_planilha else resolve_output_xlsx_path()
     if not p_origem.exists() or p_origem.stat().st_size == 0:
         return None
@@ -351,7 +470,6 @@ def fazer_backup_planilha_ativa(
         shutil.copy2(str(p_origem), str(p_destino))
         return p_destino
     except Exception:
-        # Em caso de bloqueio temporário por estar aberto em outro programa
         try:
             with open(p_origem, "rb") as f_in, open(p_destino, "wb") as f_out:
                 shutil.copyfileobj(f_in, f_out)
@@ -367,11 +485,24 @@ def aplicar_reorganizacao_planilha(
 ) -> dict[str, Any]:
     """Aplica as alterações de visibilidade e gera a nova planilha de trabalho ativa.
 
-    1. Copia a planilha de trabalho atual para 'Planilhas anteriores/' (backup datado).
-    2. Sincroniza edições manuais feitas na planilha ativa em uso para o SQLite.
-    3. Processa novos arquivos CSV caso existam na raiz ou na pasta de entrada.
-    4. Consulta todos os protocolos do backlog cujos meses NÃO estejam arquivados.
-    5. Gera a nova Planilha_Controle_VRE_Ativa.xlsx institucional de 32 colunas.
+    Passos executados:
+    1. Salva backup preventivo da planilha em uso na pasta `Planilhas anteriores/`.
+    2. Sincroniza qualquer edição manual feita diretamente no Excel para o SQLite.
+    3. Se houver novo CSV pendente, processa-o via runner seco.
+    4. Consulta todos os protocolos dos meses ativos (não arquivados).
+    5. Gera atomicamente a nova `Planilha_Controle_VRE_Ativa.xlsx` institucional.
+
+    Args:
+        conn: Conexão SQLite opcional.
+        saida_xlsx: Caminho do arquivo de saída.
+        caminho_template: Caminho do template Excel.
+
+    Returns:
+        dict[str, Any]: Sumário com contadores de linhas, meses e mensagem de status.
+
+    Complexity:
+        Tempo: O(N_ativos * Colunas) para escrita no Excel.
+        Espaço: O(N_ativos * Colunas).
     """
     # 1. Backup da planilha em uso
     backup_path = fazer_backup_planilha_ativa(caminho_planilha=saida_xlsx)
@@ -385,7 +516,6 @@ def aplicar_reorganizacao_planilha(
 
     if csv_pendente is not None and csv_pendente.exists():
         csv_nome = csv_pendente.name
-        # Executa o runner seco que já sincroniza a planilha ativa, inclui o novo CSV e respeita as competências
         linhas_geradas = processar_fluxo_seco(
             caminho_csv=csv_pendente,
             saida_xlsx=saida_xlsx,
@@ -393,7 +523,6 @@ def aplicar_reorganizacao_planilha(
             silencioso=True,
         )
     else:
-        # Se não há CSV novo, sincroniza edições da planilha ativa e monta a partir do banco respeitando os meses ativos
         if conn is None:
             conn = get_triagem_db()
             close_conn = True
@@ -466,7 +595,20 @@ def aplicar_reorganizacao_planilha(
 
 
 def listar_fiscais_cadastrados(conn: sqlite3.Connection | None = None) -> list[str]:
-    """Retorna lista alfabética e sem duplicatas de todos os fiscais registrados."""
+    """Retorna lista alfabética e sem duplicatas de todos os fiscais registrados.
+
+    Combina registros de `historico_fiscais` e `vre_backlog` via `UNION` SQL.
+
+    Args:
+        conn: Conexão SQLite opcional.
+
+    Returns:
+        list[str]: Lista alfabética de nomes de fiscais em caixa alta.
+
+    Complexity:
+        Tempo: O(F log F) onde F é a quantidade de fiscais distintos.
+        Espaço: O(F).
+    """
     close_conn = False
     if conn is None:
         conn = get_triagem_db()
@@ -498,7 +640,20 @@ def obter_ultimos_atendimentos(
     fiscal_filtro: str | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> list[dict[str, Any]]:
-    """Retorna os atendimentos mais recentes gravados no histórico e backlog."""
+    """Retorna os atendimentos mais recentes gravados no histórico e no backlog.
+
+    Args:
+        limit: Quantidade máxima de linhas a retornar (padrão 50).
+        fiscal_filtro: Nome específico de fiscal para filtrar ou 'Todos'.
+        conn: Conexão SQLite opcional.
+
+    Returns:
+        list[dict[str, Any]]: Lista de dicionários representando os atendimentos.
+
+    Complexity:
+        Tempo: O(limit).
+        Espaço: O(limit).
+    """
     close_conn = False
     if conn is None:
         conn = get_triagem_db()
@@ -575,7 +730,28 @@ def buscar_historico_fiscais(
     limit: int = 100,
     conn: sqlite3.Connection | None = None,
 ) -> list[dict[str, Any]]:
-    """Busca fiscais históricos associados a um CNPJ, Razão Social ou filtrados por Fiscal."""
+    """Busca fiscais históricos associados a um CNPJ, Razão Social ou filtrados por Fiscal.
+
+    Tratamento de Pesquisa:
+    1. Se `termo_busca` for vazio, retorna os últimos atendimentos.
+    2. Se `termo_busca` normalizar para um CNPJ de 14 dígitos, executa busca exata por CNPJ
+       em `historico_fiscais` e no `vre_backlog`.
+    3. Se for busca textual por Razão Social, aplica sanitização rigorosa de caracteres curinga
+       do SQL LIKE (escapando `%` e `_` com `ESCAPE '\\'`) para evitar queries custosas ou erros de sintaxe.
+
+    Args:
+        termo_busca: CNPJ, Razão Social ou substring a buscar.
+        fiscal_filtro: Nome específico do fiscal ou 'Todos'.
+        limit: Limite máximo de resultados (padrão 100).
+        conn: Conexão SQLite opcional.
+
+    Returns:
+        list[dict[str, Any]]: Lista de correspondências com CNPJ, Razão Social, Fiscal e Origem.
+
+    Complexity:
+        Tempo: O(1) indexado para CNPJ de 14 dígitos; O(N) para busca textual LIKE por Razão Social.
+        Espaço: O(limit).
+    """
     termo = str(termo_busca or "").strip()
     fisc = str(fiscal_filtro or "").strip()
     if fisc.startswith("Todos"):

@@ -1,17 +1,18 @@
 """Executável Seco Operacional da Triagem VRE (Single-Action Headless Runner).
 
-Fluxo de Execução Silenciosa:
-1. Resolução do CSV de entrada via sys.argv[1] (arraste/drag-and-drop) ou busca automática
-   do arquivo .csv mais recente na pasta `entrada_csv/`.
-2. Leitura com suporte a ISO-8859-1 / Windows-1252 e delimitador ';'.
-3. Cruzamento no SQLite:
-   - Identificação do fiscal anterior via histórico do CNPJ limpo.
-   - Detecção de Restrição e Noturno com curto-circuito de CNAEs.
-   - Atribuição de Área por Bairro com fallback para o banco `cep_areas.db`.
-4. Inserção protegida no backlog (`INSERT OR IGNORE` no `protocolo_licenca`).
-5. Recuperação de todos os protocolos ativos (`status IN ('PENDENTE', 'DISTRIBUIDO')`).
-6. Exportação rápida e atômica da `Planilha_Controle_VRE_Ativa.xlsx`.
-7. Encerramento limpo com sys.exit(0).
+Módulo principal de processamento em lote da Inspetoria Fiscal da SMAURB.
+Projetado para execução instantânea, silenciosa e com zero dependências de interface gráfica:
+1. Resolução do arquivo CSV de entrada:
+   - Suporta argumento direto via `sys.argv[1]` (Drag & Drop de arquivo sobre o `.bat`).
+   - Busca automática do `.csv` mais recente na raiz do projeto (`BASE_DIR`) ou em `entrada_csv/`.
+2. Leitura resiliente com detecção automática de encodings (UTF-8 com/sem BOM, CP1252, Latin-1).
+3. Cruzamento relacional com SQLite de alta velocidade:
+   - Identificação do fiscal anterior histórico via CNPJ limpo de 14 dígitos.
+   - Detecção de Restrição e Noturno com algoritmo de curto-circuito em cache de memória de CNAEs.
+   - Atribuição geográfica de Área por Bairro com fallback para `cep_areas.db`.
+4. Inserção protegida no banco (`INSERT OR IGNORE` no `protocolo_licenca`).
+5. Recuperação dos protocolos de todas as competências ativas (não arquivadas).
+6. Exportação atômica da `Planilha_Controle_VRE_Ativa.xlsx` e arquivamento do CSV em `processados/`.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from src.core.config import (
     CSV_ENCODINGS,
     ENTRADA_CSV_DIR,
     OUTPUT_XLSX_PATH,
+    PLANILHAS_ANTERIORES_DIR,
     PROCESSADOS_CSV_DIR,
     ensure_directories,
 )
@@ -52,6 +54,7 @@ from src.core.excel_writer import (
     registrar_hash_planilha_gerada,
     sincronizar_planilha_ativa_com_banco,
 )
+from src.core.historico_importer import normalizar_data_atendimento
 from src.core.normalizer import (
     extrair_cnaes,
     formatar_cnpj,
@@ -59,19 +62,26 @@ from src.core.normalizer import (
 )
 
 
-from src.core.historico_importer import (
-    escanear_e_importar_planilhas_antigas,
-    normalizar_data_atendimento,
-)
-
-
 def extrair_mes_competencia(data_str: str | None) -> str:
-    """Extrai 'AAAA-MM' a partir de datas nos formatos 'DD/MM/AAAA' ou 'AAAA-MM-DD'."""
+    """Extrai a competência 'AAAA-MM' a partir de datas nos formatos 'DD/MM/AAAA' ou 'AAAA-MM-DD'.
+
+    Se a data for nula ou inválida, adota o mês e ano correntes como fallback seguro.
+
+    Args:
+        data_str: String contendo a data informada no pedido ou arquivo.
+
+    Returns:
+        str: Competência no formato padrão 'AAAA-MM' (ex: '2026-06').
+
+    Complexity:
+        Tempo: O(1).
+        Espaço: O(1).
+    """
     if not data_str:
         return datetime.date.today().strftime("%Y-%m")
 
     d_limpa = str(data_str).strip()
-    # Formato DD/MM/AAAA
+    # Formato brasileiro DD/MM/AAAA
     if "/" in d_limpa:
         partes = d_limpa.split("/")
         if len(partes) == 3:
@@ -79,7 +89,7 @@ def extrair_mes_competencia(data_str: str | None) -> str:
             if len(ano) == 4 and len(mes) == 2:
                 return f"{ano}-{mes}"
 
-    # Formato AAAA-MM-DD
+    # Formato ISO AAAA-MM-DD
     if "-" in d_limpa:
         partes = d_limpa.split("-")
         if len(partes) >= 2:
@@ -94,7 +104,28 @@ def localizar_arquivo_csv(
     caminho_arg: str | None = None,
     pasta_entrada: Path | str | None = None,
 ) -> Path | None:
-    """Localiza o arquivo CSV a ser processado com máxima conveniência para o usuário."""
+    """Localiza o arquivo CSV a ser processado com máxima conveniência operacional.
+
+    Hierarquia de Busca:
+    1. Argumento direto de linha de comando ou Drag & Drop sobre o script `.bat`.
+    2. Arquivo `.csv` mais recente depositado diretamente na pasta raiz do projeto (`BASE_DIR`).
+    3. Arquivo `.csv` mais recente na pasta configurada `ENTRADA_CSV_DIR`.
+    4. Fallback na subpasta `entrada_csv` da raiz caso exista.
+
+    Args:
+        caminho_arg: Caminho explícito opcional fornecido por argumento CLI.
+        pasta_entrada: Pasta opcional para busca de arquivos de entrada.
+
+    Returns:
+        Path | None: Caminho do arquivo CSV mais recente ou None se nenhum for encontrado.
+
+    Raises:
+        FileNotFoundError: Se um caminho foi explicitamente passado em `caminho_arg` mas não existe.
+
+    Complexity:
+        Tempo: O(F) onde F é a quantidade de arquivos .csv na pasta examinada.
+        Espaço: O(F) para listagem transitória de arquivos.
+    """
     ensure_directories()
 
     # 1. Argumento direto de linha de comando ou Drag & Drop sobre o .bat
@@ -104,7 +135,7 @@ def localizar_arquivo_csv(
             return p
         raise FileNotFoundError(f"Arquivo CSV especificado não encontrado: {caminho_arg}")
 
-    # 2. Prioridade Máxima: busca arquivo .csv diretamente na pasta raiz (ao lado dos .bats)
+    # 2. Prioridade Máxima: busca arquivo .csv diretamente na pasta raiz (ao lado dos executáveis)
     if BASE_DIR.exists():
         arquivos_raiz = [f for f in BASE_DIR.glob("*.csv") if f.is_file()]
         if arquivos_raiz:
@@ -128,15 +159,31 @@ def localizar_arquivo_csv(
 
 
 def ler_linhas_csv(caminho_csv: Path) -> list[dict[str, str]]:
-    """Lê o arquivo CSV testando encodings comuns (Latin-1 / CP1252 / UTF-8)."""
+    """Lê o arquivo CSV aplicando detecção em cascata de encodings e sanitização de cabeçalhos.
+
+    Testa sequencialmente as codificações declaradas em `CSV_ENCODINGS`:
+    `utf-8-sig` (com BOM), `utf-8`, `cp1252`, `iso-8859-1` e `latin-1`.
+    Remove espaços em branco nos nomes de colunas e valores de cada registro.
+
+    Args:
+        caminho_csv: Caminho para o arquivo CSV no sistema de arquivos.
+
+    Returns:
+        list[dict[str, str]]: Lista de dicionários representando as linhas do CSV.
+
+    Raises:
+        ValueError: Se nenhuma das codificações suportadas conseguir decodificar o arquivo.
+
+    Complexity:
+        Tempo: O(K) onde K é o número total de caracteres do arquivo CSV.
+        Espaço: O(R * C) onde R é o número de linhas e C o número de colunas.
+    """
     conteudo = None
-    encoding_usado = None
 
     for enc in CSV_ENCODINGS:
         try:
             with open(caminho_csv, "r", encoding=enc) as f:
                 conteudo = f.read()
-                encoding_usado = enc
                 break
         except (UnicodeDecodeError, OSError):
             continue
@@ -161,7 +208,7 @@ def ler_linhas_csv(caminho_csv: Path) -> list[dict[str, str]]:
     for row in reader:
         if not row or not any(c.strip() for c in row):
             continue
-        d = {}
+        d: dict[str, str] = {}
         for idx, col_nome in enumerate(cabecalhos):
             if col_nome:
                 d[col_nome] = row[idx].strip() if idx < len(row) else ""
@@ -179,9 +226,42 @@ def processar_fluxo_seco(
     template_path: Path | str | None = None,
     entrada_dir: Path | str | None = None,
 ) -> int:
-    """Executa a triagem completa e gera a planilha de trabalho ativa."""
+    """Executa a triagem completa do VRE e gera a planilha de trabalho ativa.
+
+    Pipeline Operacional Completo:
+    1. Localização e resolução do arquivo CSV.
+    2. Abertura das conexões com `triagem_vre.db` e `cep_areas.db`.
+    3. Sincronização prévia de edições manuais feitas no Excel ativo existente para o banco.
+    4. Processamento dos registros do novo CSV:
+       - Normalização do CNPJ (14 dígitos).
+       - Busca do fiscal anterior titular da empresa (histórico ou backlog).
+       - Análise de CNAEs com curto-circuito de flags (`flag_restr`, `flag_noturno`).
+       - Classificação de Tipo de Serviço (omissão estrita em indeferidos, 'Diurno Livre' se titular, etc.).
+       - Resolução de Área via Bairro -> CEP -> Fila de pendências.
+    5. Inserção protegida (`INSERT OR IGNORE`) no backlog central.
+    6. Reconciliação automática de áreas e saneamento de indeferidos.
+    7. Consulta de todos os protocolos dos meses ativos (não arquivados).
+    8. Backup preventivo da planilha anterior em `Planilhas anteriores/`.
+    9. Geração da nova `Planilha_Controle_VRE_Ativa.xlsx` e arquivamento do CSV em `processados/`.
+
+    Args:
+        caminho_csv: Caminho opcional do arquivo CSV. Se None, busca automaticamente.
+        saida_xlsx: Caminho opcional da planilha de saída (padrão: `OUTPUT_XLSX_PATH`).
+        silencioso: Se False, emite logs de progresso no console.
+        triagem_db_path: Caminho alternativo do banco central.
+        cep_db_path: Caminho alternativo do banco de CEPs.
+        template_path: Caminho alternativo do template Excel.
+        entrada_dir: Diretório de busca de CSVs de entrada.
+
+    Returns:
+        int: Quantidade total de linhas ativas inseridas na planilha Excel gerada.
+
+    Complexity:
+        Tempo: O(N_csv + N_backlog) de processamento linear.
+        Espaço: O(N_backlog * Colunas) de memória para o Excel gerado.
+    """
     ensure_directories()
-    arquivo_csv = None
+    arquivo_csv: Path | None = None
     if caminho_csv:
         p = Path(caminho_csv).resolve()
         if p.exists() and p.is_file():
@@ -223,7 +303,7 @@ def processar_fluxo_seco(
 
         cur_triagem = conn_triagem.cursor()
 
-        # Cache em memória de CNAEs e Fiscais para velocidade instantânea
+        # Cache em memória de CNAEs para velocidade instantânea sem consultas repetitivas ao banco
         regras_cnae_cache: dict[str, tuple[int, int]] = {}
         cur_triagem.execute("SELECT cnae_7digitos, restricao, noturno FROM regras_cnae;")
         for r in cur_triagem.fetchall():
@@ -302,7 +382,7 @@ def processar_fluxo_seco(
                     if n_val:
                         flag_noturno = 1
 
-                    # Curto-circuito: se ambas as flags atingiram 1, encerra a busca
+                    # Curto-circuito: se ambas as flags atingiram 1, encerra a busca de imediato
                     if flag_restr == 1 and flag_noturno == 1:
                         break
 
@@ -424,7 +504,6 @@ def processar_fluxo_seco(
     if saida_final.exists() and saida_final.stat().st_size > 0:
         if "tests" not in saida_final.parts and "test_data" not in saida_final.parts:
             try:
-                from src.core.config import PLANILHAS_ANTERIORES_DIR
                 PLANILHAS_ANTERIORES_DIR.mkdir(parents=True, exist_ok=True)
                 ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                 bkp_nome = f"Planilha_Controle_VRE_Ativa_anterior_{ts}.xlsx"
@@ -472,7 +551,11 @@ def processar_fluxo_seco(
 
 
 def main() -> None:
-    """Ponto de entrada do executável seco (triagem_vre.exe)."""
+    """Ponto de entrada do executável seco (triagem_vre.exe).
+
+    Captura argumentos de linha de comando ou arrastamento de arquivo (.csv)
+    e executa o processamento com captura defensiva de exceções gravadas em log.
+    """
     arg_csv = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else None
     try:
         processar_fluxo_seco(caminho_csv=arg_csv, silencioso=False)
@@ -488,7 +571,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # Se chamado com --verbose, exibe logs no terminal para depuração
     if "--verbose" in sys.argv:
         caminho = None
         for a in sys.argv[1:]:

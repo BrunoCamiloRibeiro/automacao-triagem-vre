@@ -5,6 +5,7 @@ em 'Planilhas anteriores/' ou na raiz, higieniza linhas desorganizadas,
 descarta duplicatas e alimenta:
 1. `historico_fiscais` (triagem_vre.db)
 2. `cep_mapeamento` (cep_areas.db)
+3. `vre_backlog` (triagem_vre.db)
 
 Executado sob demanda via 'Configurações/Importar_Planilhas_Antigas.bat'.
 """
@@ -28,6 +29,12 @@ from src.core.historico_importer import (
 
 
 def main() -> None:
+    """Ponto de entrada do script de carga de planilhas antigas.
+
+    Suporta passagem opcional de caminho por argumento (`sys.argv[1]`)
+    ou varredura automática em `Planilhas anteriores/` e na raiz.
+    Exibe estatísticas de processamento no terminal e tempo total transcorrido.
+    """
     print("=" * 78)
     print(" SMAURB / INSPETORIA FISCAL - CARGA DE PLANILHAS HISTÓRICAS")
     print(" Mapeamento Automático de Fiscais e CEPs x Áreas")

@@ -1,12 +1,15 @@
 """Módulo de Gravação e Otimização de Planilhas Excel com OpenPyXL.
 
-Gera o arquivo oficial `Planilha_Controle_VRE_Ativa.xlsx` reproduzindo fielmente:
-- Visual da planilha de trabalho do exemplo oficial da Inspetoria Fiscal
-- Ordem e dimensões exatas das 31 colunas (A a AE)
-- Injeção de Plain Values (texto puro estático, sem fórmulas lentas)
-- As 12 regras de formatação condicional na exata ordem institucional
-- Congelamento de painel em A3 e auto-filtro A2:AE
-- Cópia de backup preventivo na pasta `/Planilhas anteriores`
+Responsável por gerar o arquivo oficial de produção `Planilha_Controle_VRE_Ativa.xlsx`
+reproduzindo com fidelidade milimétrica o padrão institucional da Inspetoria Fiscal:
+- Arquitetura de 32 colunas oficiais (A a AF), incluindo a coluna única de Restrição (E).
+- Injeção de Plain Values (valores literais pré-computados em Python, eliminando fórmulas
+  lentas de VLOOKUP/PROCV/SE no Excel que causavam lentidão e travamento).
+- Sincronização bidirecional inteligente baseada em hash SHA-256 para capturar edições manuais
+  do operador diretamente das células do Excel de volta para o SQLite.
+- Aplicação das 15 regras de formatação condicional na exata ordem de prioridade visual.
+- Congelamento de painel em A3 e ativação de auto-filtro na linha 2.
+- Backups preventivos datados na pasta `/Planilhas anteriores`.
 """
 
 from __future__ import annotations
@@ -52,15 +55,30 @@ from src.core.normalizer import (
     normalizar_cnpj,
 )
 
-# Cache em memória do último hash gerado pelo sistema para cada caminho de planilha
+# Cache em memória do último hash SHA-256 gerado pelo sistema para cada caminho de planilha
 _ULTIMO_HASH_GERADO: dict[str, str] = {}
 
 # Chave de migração única para limpar as datas anteriores preenchidas automaticamente na Coluna F (Data)
-_MIGRACAO_LIMPEZA_COL_F_KEY = "limpeza_unica_data_col_f_v15"
+_MIGRACAO_LIMPEZA_COL_F_KEY: str = "limpeza_unica_data_col_f_v15"
 
 
 def _migracao_limpeza_col_f_concluida(triagem_conn: sqlite3.Connection | None) -> bool:
-    """Verifica se a limpeza única da coluna Data (F) já foi executada no banco."""
+    """Verifica se a limpeza única da coluna Data (F) já foi executada no banco central.
+
+    A versão 1.5 introduziu a separação definitiva entre a Data Oficial do VRE (Coluna N)
+    e a Coluna de Data Manual de Distribuição (Coluna F). Esta rotina garante que uma migração
+    única limpe datas automáticas antigas da Coluna F, preservando qualquer edição manual futura.
+
+    Args:
+        triagem_conn: Conexão SQLite ativa com `triagem_vre.db`.
+
+    Returns:
+        bool: True se a migração já foi registrada na tabela `controle_migracoes`.
+
+    Complexity:
+        Tempo: O(1).
+        Espaço: O(1).
+    """
     if triagem_conn is None:
         return False
     try:
@@ -79,44 +97,52 @@ def _migracao_limpeza_col_f_concluida(triagem_conn: sqlite3.Connection | None) -
         return False
 
 
-# Definição oficial das 32 colunas da planilha de trabalho ativa (31 originais + nova coluna única de Restrição)
-COLUNAS_CABECALHO = [
-    ("Número ordem ", 17.43),
-    ("Status", 15.57),
-    ("Fiscal", 15.57),
-    ("Tipo de Serviço", 18.29),
-    ("Restrição", 16.0),          # Nova coluna única de classificação: 'Sem Restrição', 'Com Restrição', 'Noturno'
-    ("Data", 15.57),
-    ("IPTU", 12.43),
-    ("ÁREA", 20.0),
-    ("Endereço", 85.14),
-    ("Protocolo Existente", 55.0),
-    ("ProtocoloSigm / OS", 21.0),
-    ("ProtocoloSil", 11.29),
-    ("ProtocoloLicenca", 16.57),
-    ("Data", 10.71),
-    ("GrauRiscoGeral", 7.0),
-    ("SituacaoPostura", 13.14),
-    ("InscricaoMunicipal", 21.0),
-    ("Cnpj", 18.43),
-    ("NomeEmpresarial", 48.0),
-    ("Telefone", 11.57),
-    ("E-mail", 17.43),
-    ("TipoEndereco", 5.71),
-    ("Logradouro", 27.86),
-    ("Numero", 8.0),
-    ("Complemento", 12.43),
-    ("Bairro", 56.14),
-    ("Cep", 11.57),
-    ("FinalidadeEndereco", 17.86),
-    ("CnaesLicenciadas", 50.71),
-    ("CnaesNaoLicenciadas", 11.57),
-    ("Iptu", 13.0),
-    ("CEP4", 13.0),
+# ==============================================================================
+# DEFINIÇÃO OFICIAL DAS 32 COLUNAS INSTITUCIONAIS (ORDEM E LARGURA EM CARACTERES)
+# ==============================================================================
+# Colunas padronizadas em estrita harmonia com o modelo da Inspetoria Fiscal da SMAURB:
+COLUNAS_CABECALHO: list[tuple[str, float]] = [
+    ("Número ordem ", 17.43),      # Col 1 (A): Sequencial sequencial 1, 2, 3...
+    ("Status", 15.57),             # Col 2 (B): Em Andamento, Deferido, Indeferido, etc. (vazio se pendente)
+    ("Fiscal", 15.57),             # Col 3 (C): Nome do Fiscal responsável
+    ("Tipo de Serviço", 18.29),    # Col 4 (D): Diurno Livre, Noturno, Noturno entregue, etc.
+    ("Restrição", 16.0),           # Col 5 (E): Coluna Única: Sem Restrição, Com Restrição, Noturno
+    ("Data", 15.57),               # Col 6 (F): Data manual do fiscal (vazia por padrão)
+    ("IPTU", 12.43),               # Col 7 (G): Número de cadastro imobiliário
+    ("ÁREA", 20.0),                # Col 8 (H): Área fiscal municipal (CENTRAL, HB, etc.)
+    ("Endereço", 85.14),           # Col 9 (I): Endereço completo estático harmonizado
+    ("Protocolo Existente", 55.0), # Col 10 (J): Número de protocolos existentes
+    ("ProtocoloSigm / OS", 21.0),  # Col 11 (K): Ordem de serviço no sistema Sigm
+    ("ProtocoloSil", 11.29),       # Col 12 (L): Protocolo SIL estadual
+    ("ProtocoloLicenca", 16.57),   # Col 13 (M): Identificador único do pedido no VRE
+    ("Data", 10.71),               # Col 14 (N): Data oficial de envio pelo contribuinte no VRE
+    ("GrauRiscoGeral", 7.0),       # Col 15 (O): Grau de risco (BAIXO, MEDIO, ALTO)
+    ("SituacaoPostura", 13.14),    # Col 16 (P): Situação na Postura (DEFERIDO, INDEFERIDO, etc.)
+    ("InscricaoMunicipal", 21.0),  # Col 17 (Q): Inscrição municipal cadastrada
+    ("Cnpj", 18.43),               # Col 18 (R): CNPJ formatado da empresa
+    ("NomeEmpresarial", 48.0),     # Col 19 (S): Razão Social da empresa
+    ("Telefone", 11.57),           # Col 20 (T): Telefone de contato
+    ("E-mail", 17.43),             # Col 21 (U): E-mail do solicitante/contador
+    ("TipoEndereco", 5.71),        # Col 22 (V): RUA, AV, ALAMEDA, etc.
+    ("Logradouro", 27.86),         # Col 23 (W): Nome da via pública
+    ("Numero", 8.0),               # Col 24 (X): Número predial
+    ("Complemento", 12.43),        # Col 25 (Y): Sala, bloco, galpão
+    ("Bairro", 56.14),             # Col 26 (Z): Bairro declarado
+    ("Cep", 11.57),                # Col 27 (AA): CEP do estabelecimento
+    ("FinalidadeEndereco", 17.86), # Col 28 (AB): Finalidade cadastral do endereço
+    ("CnaesLicenciadas", 50.71),   # Col 29 (AC): Relação de CNAEs licenciadas
+    ("CnaesNaoLicenciadas", 11.57),# Col 30 (AD): CNAEs não licenciadas
+    ("Iptu", 13.0),                # Col 31 (AE): IPTU auxiliar de conferência
+    ("CEP4", 13.0),                # Col 32 (AF): CEP raiz (5 primeiros dígitos)
 ]
 
-# Regras de Formatação Condicional na EXATA ordem e prioridade institucional
-REGRAS_CONDICIONAIS_ORDEM = [
+# ==============================================================================
+# REGRAS DE FORMATAÇÃO CONDICIONAL NA EXATA ORDEM DE PRIORIDADE INSTITUCIONAL
+# ==============================================================================
+# No Excel, a ordem de avaliação das regras define a cor final da célula.
+# Regras de Status explícito (Em Andamento, Indeferido, Finalizado) prevalecem
+# sobre regras de fiscal atribuído e classificação de serviço.
+REGRAS_CONDICIONAIS_ORDEM: list[tuple[str, str]] = [
     ('$B3="Em Andamento"', COR_EM_ANDAMENTO),
     ('$B3="Indeferido"', COR_FINALIZADO_STATUS),
     ('$B3="Cancelado"', COR_FINALIZADO_STATUS),
@@ -136,7 +162,18 @@ REGRAS_CONDICIONAIS_ORDEM = [
 
 
 def _calcular_hash_xlsx(caminho: Path) -> str:
-    """Calcula o hash SHA-256 de um arquivo Excel em disco."""
+    """Calcula o hash SHA-256 de um arquivo Excel em disco.
+
+    Args:
+        caminho: Caminho absoluto para o arquivo .xlsx.
+
+    Returns:
+        str: Hash SHA-256 em hexadecimal ou string vazia se o arquivo não existir.
+
+    Complexity:
+        Tempo: O(B) onde B é o tamanho do arquivo em disco.
+        Espaço: O(1).
+    """
     if not caminho.exists() or not caminho.is_file():
         return ""
     hasher = hashlib.sha256()
@@ -153,7 +190,23 @@ def registrar_hash_planilha_gerada(
     caminho_xlsx: Path | str,
     triagem_conn: sqlite3.Connection | None = None,
 ) -> str:
-    """Registra o hash SHA-256 da planilha recém-gerada pelo sistema."""
+    """Registra o hash SHA-256 da planilha recém-gerada pelo sistema.
+
+    Salva o hash em memória e na tabela `controle_planilha_ativa`.
+    Dessa forma, o sistema sabe com exatidão matemática se o usuário editou ou não
+    o arquivo no Excel antes de executar a próxima triagem.
+
+    Args:
+        caminho_xlsx: Caminho do arquivo Excel salvo.
+        triagem_conn: Conexão SQLite opcional para persistência do hash em banco.
+
+    Returns:
+        str: Hash SHA-256 registrado.
+
+    Complexity:
+        Tempo: O(B) onde B é o tamanho do arquivo Excel.
+        Espaço: O(1).
+    """
     p = Path(caminho_xlsx).resolve()
     h = _calcular_hash_xlsx(p)
     if not h:
@@ -192,7 +245,19 @@ def _obter_hash_planilha_registrado(
     caminho_xlsx: Path,
     triagem_conn: sqlite3.Connection | None = None,
 ) -> str:
-    """Recupera o último hash SHA-256 gerado pelo sistema para a planilha ativa."""
+    """Recupera o último hash SHA-256 gerado pelo sistema para a planilha ativa.
+
+    Args:
+        caminho_xlsx: Caminho do arquivo Excel a verificar.
+        triagem_conn: Conexão SQLite opcional com o banco de triagem.
+
+    Returns:
+        str: Hash registrado ou string vazia.
+
+    Complexity:
+        Tempo: O(1).
+        Espaço: O(1).
+    """
     chave = str(caminho_xlsx.resolve())
     if triagem_conn is not None:
         try:
@@ -214,7 +279,23 @@ def _obter_hash_planilha_registrado(
 
 
 def _limpar_valor_celula(val: Any) -> str:
-    """Converte valor de célula do Excel em string limpa, preservando inteiros e datas."""
+    """Converte valor de célula do Excel em string limpa, preservando inteiros e datas.
+
+    Trata:
+    - Booleans, ints, floats (removendo sufixo .0 de inteiros).
+    - Objetos `datetime.date` e `datetime.datetime` formatados em 'AAAA-MM-DD'.
+    - Nulos e valores de erro do Excel ('#N/A', '#REF!') convertidos para `""`.
+
+    Args:
+        val: Valor extraído de `cell.value`.
+
+    Returns:
+        str: String sanitizada representativa do conteúdo.
+
+    Complexity:
+        Tempo: O(1).
+        Espaço: O(1).
+    """
     if val is None:
         return ""
     if isinstance(val, bool):
@@ -241,9 +322,34 @@ def sincronizar_planilha_ativa_com_banco(
     cep_conn: sqlite3.Connection | None = None,
     forcar: bool = False,
 ) -> int:
-    """Lê a Planilha_Controle_VRE_Ativa.xlsx existente e sincroniza todas as edições manuais
-    feitas pelo operador de volta para o banco SQLite (vre_backlog, historico_fiscais e cep_areas.db)
-    antes que novos CSVs sejam processados ou a planilha seja regenerada.
+    """Lê a planilha ativa existente e sincroniza edições manuais de volta para o SQLite.
+
+    Garante a regra de ouro de Zero Perda de Dados:
+    Quando o fiscal ou operador abre o Excel e altera status, atribui fiscal, digita número
+    de OS/Sigm, corrige IPTU ou ajusta Área, essas informações são salvas de volta no banco
+    antes que novos arquivos CSV sejam processados ou que o arquivo seja recriado.
+
+    Fluxo de Trabalho:
+    1. Compara o hash atual do arquivo no disco com o hash gravado na última geração.
+       Se idênticos e `forcar=False`, encerra imediatamente sem custo de processamento.
+    2. Lê os dados em modo `read_only=True` e `data_only=True`.
+    3. Mapeia colunas da linha 2 em diante.
+    4. Identifica o protocolo de licença correspondente no banco.
+    5. Detecta se houve modificação manual e atualiza `vre_backlog`, `historico_fiscais`
+       e `cep_areas.db`.
+
+    Args:
+        caminho_xlsx: Caminho para a planilha ativa em disco.
+        triagem_conn: Conexão SQLite opcional com `triagem_vre.db`.
+        cep_conn: Conexão SQLite opcional com `cep_areas.db`.
+        forcar: Se True, força a leitura mesmo que os hashes coincidam.
+
+    Returns:
+        int: Quantidade de registros modificados e sincronizados com sucesso.
+
+    Complexity:
+        Tempo: O(L) onde L é o número de linhas da planilha.
+        Espaço: O(L) para armazenamento das tuplas de atualização.
     """
     alvo = Path(caminho_xlsx) if caminho_xlsx else OUTPUT_XLSX_PATH
     if not alvo.exists() or not alvo.is_file() or alvo.stat().st_size == 0:
@@ -269,7 +375,7 @@ def sincronizar_planilha_ativa_com_banco(
         hash_registrado = _obter_hash_planilha_registrado(alvo, triagem_conn)
 
         # Se a planilha em disco tem exatamente o mesmo hash de quando foi gerada pelo sistema,
-        # não houve nenhuma edição no Excel a sincronizar.
+        # nenhuma edição humana ocorreu no arquivo.
         if not forcar and hash_atual and hash_registrado and hash_atual == hash_registrado:
             return 0
 
@@ -287,7 +393,7 @@ def sincronizar_planilha_ativa_com_banco(
             return 0
 
         cabecalho_l2 = [str(c or "").strip().upper() for c in linhas_planilha[1]]
-        # Verifica se é de fato uma planilha com cabeçalho de controle VRE
+        # Validação estrita: certifica-se de que é a planilha de trabalho oficial
         if not any(k in cabecalho_l2 for k in ("STATUS", "FISCAL", "PROTOCOLOLICENCA", "CNPJ")):
             return 0
 
@@ -414,7 +520,7 @@ def sincronizar_planilha_ativa_com_banco(
                     data_imp_final = data_hoje
             meses_ativos_detectados.add(mes_comp_final)
 
-            # Status: se o usuário preencheu algo em Status (ex: 'Em Andamento', 'Deferido', 'Indeferido', etc.), preserva integralmente
+            # Higienização de Status: se o usuário preencheu Status (ex: 'Em Andamento', 'Deferido', etc.), preserva
             status_upper = status_excel.upper()
             if not status_excel or status_upper in (
                 "PENDENTE",
@@ -458,7 +564,7 @@ def sincronizar_planilha_ativa_com_banco(
                 else:
                     extras.pop("RestricaoCustom", None)
 
-                # Tipo de Serviço (quando tem dono e não é noturno -> Diurno Livre, salvo se editado para Cota/VP/Entregue/etc.)
+                # Tipo de Serviço (quando tem dono e não é noturno -> Diurno Livre, salvo se editado)
                 tem_dono_excel = bool(
                     fiscal_excel and fiscal_excel.upper() not in ("NÃO INFORMADO", "NAO INFORMADO", "PENDENTE")
                 )
@@ -492,7 +598,7 @@ def sincronizar_planilha_ativa_com_banco(
             extras["Iptu"] = iptu_final
             extras["IPTU"] = iptu_final
 
-            # Área
+            # Área (preserva edição ou marcação de limpeza manual)
             area_ant = str(reg_ant.get("area") or "").strip() if reg_ant else ""
             area_final = harmonizar_nome_area(area_excel) if area_excel else ""
             if area_ant and not area_final:
@@ -500,7 +606,7 @@ def sincronizar_planilha_ativa_com_banco(
             elif area_final:
                 extras["AreaLimpaManualmente"] = False
 
-            # Campos extras e de endereço
+            # Campos complementares
             bairro_final = bairro_excel or (reg_ant.get("bairro_original") if reg_ant else "") or ""
             cnaes_lic_final = cnaes_lic_excel or (reg_ant.get("cnaes_licenciadas") if reg_ant else "") or ""
 
@@ -583,13 +689,13 @@ def sincronizar_planilha_ativa_com_banco(
                     )
                 )
 
-            # Aprendizado automático de Fiscal e CEP x Área editados na planilha ativa
+            # Aprendizado contínuo: fiscais e CEPs editados alimentam os bancos de histórico
             if fiscal_excel and fiscal_excel.upper() not in ("NÃO INFORMADO", "NAO INFORMADO", "PENDENTE") and len(cnpj_limpo) == 14:
                 fiscais_para_historico.append((cnpj_limpo, fiscal_excel, data_imp_final, "Planilha_Ativa"))
 
-            cep_limpo = normalizar_cep(cep_excel)
-            if area_final and len(cep_limpo) == 8:
-                ceps_para_mapear.append((cep_limpo, area_final, bairro_final))
+            cep_limpo_calc = normalizar_cep(cep_excel)
+            if area_final and len(cep_limpo_calc) == 8:
+                ceps_para_mapear.append((cep_limpo_calc, area_final, bairro_final))
 
         if atualizacoes_backlog or insercoes_backlog:
             with db_transaction(triagem_conn) as t_cur:
@@ -677,13 +783,23 @@ def limpar_indeferidos_e_normalizar_backlog(
     triagem_conn: sqlite3.Connection,
     executar_migracao_col_f: bool = True,
 ) -> int:
-    """Garante para todos os registros do backlog (inclusive os passados):
-    1. Quando está indeferido (SituacaoPostura == 'INDEFERIDO' ou Status == 'Indeferido'),
-       limpa Tipo de Serviço e Restrição (somente quando indeferido).
-    2. Quando não está indeferido e tem dono (fiscal atribuído):
-       se não é noturno e está com classificação livre sem dono, muda para 'Diurno Livre' (ou 'Noturno' se noturno).
-    3. Executa uma única vez a limpeza das datas anteriores da Coluna F (DataCol6),
-       preservando daí para frente qualquer data preenchida manualmente pelo operador.
+    """Garante a sanitização e normalização de regras de negócio em todo o backlog.
+
+    Regras aplicadas de forma abrangente:
+    1. Protocolos indeferidos (na postura ou no status) têm Tipo de Serviço e Restrição omitidos/limpos.
+    2. Protocolos com fiscal titular e não-noturnos recebem 'Diurno Livre' (ou 'Noturno' se noturnos).
+    3. Executa a migração única de limpeza das datas residuais da Coluna F caso ainda pendente.
+
+    Args:
+        triagem_conn: Conexão SQLite ativa com `triagem_vre.db`.
+        executar_migracao_col_f: Se True, efetua a limpeza única da Coluna F se necessário.
+
+    Returns:
+        int: Quantidade de registros ajustados no banco.
+
+    Complexity:
+        Tempo: O(N) onde N é o total de linhas do backlog.
+        Espaço: O(N) para a lista de atualizações.
     """
     precisa_limpar_col_f = executar_migracao_col_f and not _migracao_limpeza_col_f_concluida(triagem_conn)
 
@@ -783,7 +899,16 @@ def limpar_indeferidos_e_normalizar_backlog(
 
 
 def aplicar_regras_condicionais(ws, sqref: str) -> None:
-    """Aplica as regras de formatação condicional na exata ordem institucional do exemplo."""
+    """Aplica as regras de formatação condicional na exata ordem institucional do exemplo.
+
+    Args:
+        ws: Worksheet do OpenPyXL.
+        sqref: Faixa de células no formato 'A3:AF5000'.
+
+    Complexity:
+        Tempo: O(R) onde R é o número de regras (15).
+        Espaço: O(1).
+    """
     for formula, cor in REGRAS_CONDICIONAIS_ORDEM:
         fill = PatternFill(start_color=cor, end_color=cor, fill_type="solid")
         rule = FormulaRule(formula=[formula], fill=fill)
@@ -791,7 +916,22 @@ def aplicar_regras_condicionais(ws, sqref: str) -> None:
 
 
 def criar_template_padrao(caminho_template: Path | str | None = None, forcar: bool = False) -> Path:
-    """Cria e formata o arquivo template_triagem.xlsx caso ele não exista."""
+    """Cria e formata o arquivo template_triagem.xlsx caso ele não exista.
+
+    Constrói a planilha protótipo de 32 colunas, linhas de cabeçalho, larguras
+    oficiais, alinhamentos, congelamento de painel em A3 e regras de formatação condicional.
+
+    Args:
+        caminho_template: Caminho alvo onde salvar o template.
+        forcar: Se True, recria o template mesmo se o arquivo já existir.
+
+    Returns:
+        Path: Caminho do arquivo de template gerado.
+
+    Complexity:
+        Tempo: O(1) - construção de planilha pequena de 2 linhas.
+        Espaço: O(1).
+    """
     ensure_directories()
     alvo = Path(caminho_template) if caminho_template else TEMPLATE_XLSX_PATH
     if alvo.exists() and not forcar:
@@ -849,8 +989,25 @@ def gerar_planilha_trabalho(
 ) -> Path:
     """Gera o arquivo Planilha_Controle_VRE_Ativa.xlsx a partir dos dados do SQLite.
 
-    Garante velocidade máxima e zero travamento injetando apenas Plain Values
-    e aplicando as regras de formatação condicional na exata ordem do exemplo.
+    Otimização Extrema (Zero Travamento):
+    1. Executa backup preventivo da planilha anterior em `/Planilhas anteriores`.
+    2. Clona a estrutura protótipo do template `template_triagem.xlsx`.
+    3. Escreve exclusivamente Plain Values nas células de dados.
+    4. Aplica formatação condicional em bloco abrangente (`A3:AF5000`).
+    5. Configura congelamento em A3 e auto-filtro A2:AF.
+    6. Salva o arquivo em disco e registra o hash SHA-256 no banco para controle de edições.
+
+    Args:
+        registros_backlog: Sequência de dicionários com os protocolos a incluir.
+        caminho_saida: Caminho de saída desejado (padrão: `OUTPUT_XLSX_PATH`).
+        caminho_template: Caminho do template base (padrão: `resolve_template_path()`).
+
+    Returns:
+        Path: Caminho do arquivo Excel gerado.
+
+    Complexity:
+        Tempo: O(N * C) onde N é o número de linhas do backlog e C = 32 colunas.
+        Espaço: O(N * C) para o grafo em memória do Workbook OpenPyXL.
     """
     ensure_directories()
     dest_path = Path(caminho_saida) if caminho_saida else OUTPUT_XLSX_PATH
@@ -956,8 +1113,7 @@ def gerar_planilha_trabalho(
             else:
                 classificacao_restricao = "Sem Restrição"
 
-            # Tipo de Serviço sugerido (quando tem dono: se for noturno -> 'Noturno', se não for noturno -> 'Diurno Livre',
-            # preservando qualquer outro valor editado como 'Noturno entregue', 'Cota', 'VP', etc.)
+            # Tipo de Serviço sugerido (quando tem dono: se for noturno -> 'Noturno', se não for noturno -> 'Diurno Livre')
             fiscal_atribuido_val = (reg.get("fiscal_atribuido") or "").strip()
             tem_dono = bool(fiscal_atribuido_val and fiscal_atribuido_val != "Não Informado")
 
@@ -1009,7 +1165,7 @@ def gerar_planilha_trabalho(
             reg.get("fiscal_atribuido") or "",                        # Col 3 (C): Fiscal
             tipo_servico,                                             # Col 4 (D): Tipo de Serviço
             classificacao_restricao,                                  # Col 5 (E): Restrição (NOVA COLUNA ÚNICA)
-            data_col6,                                                # Col 6 (F): Data
+            data_col6,                                                # Col 6 (F): Data manual
             iptu_val,                                                 # Col 7 (G): IPTU
             reg.get("area") or "",                                    # Col 8 (H): ÁREA
             endereco_calculado,                                       # Col 9 (I): Endereço
@@ -1116,5 +1272,3 @@ def gerar_planilha_trabalho(
         pass
 
     return dest_path
-
-

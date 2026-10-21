@@ -1,16 +1,21 @@
 """Módulo de Importação de Histórico de Fiscais, CEPs e Backlog a partir de Planilhas Excel Antigas.
 
-Especialmente projetado para lidar com planilhas reais e legadas da fiscalização,
-que costumam ser desorganizadas, com:
-- Linhas duplicadas (mesmo CNPJ e fiscal repetidos dezenas de vezes)
-- Cabeçalhos repetidos no meio da planilha
-- Formatos de data múltiplos (BR, ISO, datetime nativo, número serial do Excel, com hora)
-- CNPJs em formato float (.0), com espaços, pontuações ou sem máscara
-- Textos nulos ou indicativos de pendência no lugar do nome do fiscal (ex: 'N/A', 'Pendente', '-')
+Especialmente projetado para processar planilhas reais e legadas da fiscalização,
+que costumam conter irregularidades estruturais:
+- Linhas duplicadas (mesmo CNPJ e fiscal repetidos dezenas de vezes).
+- Cabeçalhos secundários repetidos no meio da planilha decorrentes de cópias manuais.
+- Formatos heterogêneos de data (BR, ISO, datetime nativo, número serial do Excel, timestamps).
+- CNPJs em formato float (.0), com espaços, pontuações ou sem máscara.
+- Textos nulos ou indicativos de pendência no lugar do nome do fiscal (ex: 'N/A', 'Pendente', '-').
 
-Realiza deduplicação inteligente em memória e no banco SQLite, retendo
-sempre a data de atendimento mais recente, consolidando pares únicos (CNPJ x Fiscal),
-carregando protocolos no vre_backlog e registrando competências mensais.
+Processamento e Deduplicação Inteligente:
+1. Deduplicação em memória antes do envio ao banco SQLite:
+   - Para pares (CNPJ x Fiscal): retém a data de atendimento mais recente.
+   - Para pares (CEP x Área): retém a associação e enriquece com bairro de referência.
+   - Para protocolos: consolida dados cadastrais no `vre_backlog` com tratamento canônico de status.
+2. Persistência atômica via `INSERT ... ON CONFLICT DO UPDATE` (UPSERT).
+3. Registro de competências mensais descobertas em `controle_competencias`.
+4. Reconciliação imediata de áreas e fiscais no backlog ativo.
 """
 
 from __future__ import annotations
@@ -45,8 +50,8 @@ from src.core.normalizer import (
     normalizar_cnpj,
 )
 
-# Termos que não representam um nome de fiscal real e devem ser descartados
-TERMOS_INVALIDOS_FISCAL = {
+# Conjunto estático de termos inválidos que não representam fiscais reais
+TERMOS_INVALIDOS_FISCAL: set[str] = {
     "",
     "-",
     "--",
@@ -78,9 +83,38 @@ TERMOS_INVALIDOS_FISCAL = {
     "PROTOCOLO",
 }
 
+# Dicionário de canonicidade de status para exibição profissional
+STATUS_CANONICOS: dict[str, str] = {
+    "DEFERIDO": "Deferido",
+    "INDEFERIDO": "Indeferido",
+    "CANCELADO": "Cancelado",
+    "CASSADO": "Cassado",
+    "EM ANDAMENTO": "Em Andamento",
+}
+
 
 def normalizar_data_atendimento(val: Any, data_fallback: str) -> str:
-    """Harmoniza datas nos mais diversos formatos em uma string ISO 'AAAA-MM-DD'."""
+    """Harmoniza datas nos mais diversos formatos em uma string ISO 'AAAA-MM-DD'.
+
+    Suporta:
+    - Objetos `datetime.date` e `datetime.datetime`.
+    - Números seriais do Excel (intervalo 30.000 a 65.000, calculados a partir de 1899-12-30).
+    - Strings brasileiras 'DD/MM/AAAA' ou 'DD/MM/AA'.
+    - Strings ISO 'AAAA-MM-DD'.
+    - Timestamps compostos com horário (ex: '15/06/2024 10:30:00').
+    - Valores nulos ou inválidos retornam a data informada em `data_fallback`.
+
+    Args:
+        val: Valor bruto contendo a data a ser normalizada.
+        data_fallback: Data padrão em formato ISO caso o valor seja nulo/inválido.
+
+    Returns:
+        str: Data harmonizada no formato ISO 'AAAA-MM-DD'.
+
+    Complexity:
+        Tempo: O(1) - parsing de string e operações aritméticas simples.
+        Espaço: O(1).
+    """
     if val is None or val == "":
         return data_fallback
 
@@ -100,7 +134,7 @@ def normalizar_data_atendimento(val: Any, data_fallback: str) -> str:
     if not s or s.upper() in ("NONE", "NULL", "#N/A", "#REF!"):
         return data_fallback
 
-    # Se contiver timestamp ou hora (ex: '15/06/2024 10:30:00'), pega apenas a data
+    # Se contiver timestamp ou hora (ex: '15/06/2024 10:30:00'), isola a porção da data
     if " " in s:
         s = s.split(" ")[0].strip()
 
@@ -124,7 +158,20 @@ def normalizar_data_atendimento(val: Any, data_fallback: str) -> str:
 
 
 def _calcular_hash_arquivo(caminho: Path) -> str:
-    """Calcula hash SHA-256 para evitar reprocessar o mesmo arquivo repetidamente."""
+    """Calcula o hash SHA-256 de um arquivo para prevenir reprocessamento desnecessário.
+
+    Lê o arquivo em blocos de 64KB para manter uso de memória mínimo.
+
+    Args:
+        caminho: Caminho absoluto para o arquivo no disco.
+
+    Returns:
+        str: Hash hexadecimal SHA-256 ou string vazia em caso de falha de I/O.
+
+    Complexity:
+        Tempo: O(B) onde B é o tamanho do arquivo em bytes.
+        Espaço: O(1) - buffer fixo de 64KB.
+    """
     hasher = hashlib.sha256()
     try:
         with open(caminho, "rb") as f:
@@ -136,7 +183,20 @@ def _calcular_hash_arquivo(caminho: Path) -> str:
 
 
 def _garantir_tabelas_e_indices(conn_triagem) -> None:
-    """Garante tabelas de controle, índices e integridade para importação."""
+    """Garante tabelas de controle, índices e integridade para importação.
+
+    Cria:
+    - `historico_arquivos_importados`: Registro de auditoria com hash e contadores.
+    - Índice único `uq_hist_cnpj_fiscal` em `historico_fiscais(cnpj_limpo, fiscal)`.
+    - `controle_competencias`: Controle de meses ativos e arquivados.
+
+    Args:
+        conn_triagem: Conexão SQLite ativa com `triagem_vre.db`.
+
+    Complexity:
+        Tempo: O(1).
+        Espaço: O(1).
+    """
     with db_transaction(conn_triagem) as cur:
         cur.execute(
             """
@@ -177,9 +237,21 @@ def _garantir_tabelas_e_indices(conn_triagem) -> None:
 
 
 def _mapear_colunas_aba(ws) -> tuple[int, dict[str, int]]:
-    """Localiza a linha de cabeçalho e mapeia as posições das colunas de interesse.
+    """Localiza a linha de cabeçalho e mapeia as posições 1-based das colunas de interesse.
 
-    Varre as primeiras 6 linhas procurando termos indicativos das colunas oficiais.
+    Varre as primeiras 6 linhas da aba procurando termos indicativos das colunas oficiais
+    do VRE e das planilhas de trabalho da SMAURB.
+
+    Args:
+        ws: Aba da planilha do OpenPyXL em modo read-only.
+
+    Returns:
+        tuple[int, dict[str, int]]: Tupla contendo o número da linha de cabeçalho (1-based)
+                                    e o dicionário mapeando nome do campo -> índice da coluna.
+
+    Complexity:
+        Tempo: O(R * C) onde R <= 6 e C <= 60.
+        Espaço: O(C) para o dicionário mapeado.
     """
     for r in range(1, min(7, ws.max_row + 1)):
         valores_linha = [
@@ -261,7 +333,25 @@ def _mapear_colunas_aba(ws) -> tuple[int, dict[str, int]]:
 
 
 def reconciliar_fiscais_backlog(triagem_conn) -> int:
-    """Atribui automaticamente o fiscal histórico mais recente para protocolos sem fiscal."""
+    """Atribui automaticamente o fiscal histórico mais recente para protocolos sem fiscal.
+
+    Regra de Negócio:
+    - Protocolos pendentes ou sem fiscal cujo CNPJ já possua atendimento anterior
+      em `historico_fiscais` recebem o fiscal titular da empresa.
+    - Se o protocolo possuir atividade noturna (`flag_noturno = 1`), o tipo de serviço
+      é ajustado para 'Noturno'.
+    - Se não for noturno, é classificado como 'Diurno Livre'.
+
+    Args:
+        triagem_conn: Conexão ativa com o banco central `triagem_vre.db`.
+
+    Returns:
+        int: Número de protocolos atualizados com fiscal histórico.
+
+    Complexity:
+        Tempo: O(P) onde P é o número de protocolos sem fiscal atribuído.
+        Espaço: O(1).
+    """
     with db_transaction(triagem_conn) as cur:
         cur.execute(
             """
@@ -296,7 +386,33 @@ def importar_planilha_historico(
     cep_db_path: Path | str | None = None,
     forcar: bool = False,
 ) -> dict[str, Any]:
-    """Importa histórico de fiscais, correlações de CEP e protocolos no backlog com deduplicação."""
+    """Importa histórico de fiscais, correlações de CEP e protocolos no backlog com deduplicação.
+
+    Pipeline Completo:
+    1. Verificação de integridade e cálculo de hash SHA-256 do arquivo.
+    2. Checagem em `historico_arquivos_importados` para evitar reprocessamento idêntico (salvo se `forcar=True`).
+    3. Varredura com OpenPyXL em modo `read_only=True` e `data_only=True` para máxima velocidade.
+    4. Identificação dinâmica de colunas por aba.
+    5. Deduplicação em memória retendo as datas mais recentes e descartando fiscais inválidos.
+    6. Inserção atômica via UPSERT em `historico_fiscais`, `cep_mapeamento` e `vre_backlog`.
+    7. Limpeza preventiva de indeferidos e reconciliação geográfica de áreas.
+
+    Args:
+        caminho_xlsx: Caminho para a planilha Excel a ser importada.
+        triagem_db_path: Caminho alternativo do banco central.
+        cep_db_path: Caminho alternativo do banco de CEPs.
+        forcar: Se True, ignora a checagem de hash e reprocessa a planilha integralmente.
+
+    Returns:
+        dict[str, Any]: Dicionário com estatísticas completas da importação.
+
+    Raises:
+        FileNotFoundError: Se o arquivo especificado não existir.
+
+    Complexity:
+        Tempo: O(L) onde L é o número de linhas da planilha.
+        Espaço: O(U) onde U é o número de registros únicos consolidados em memória.
+    """
     p_arq = Path(caminho_xlsx).resolve()
     if not p_arq.exists() or not p_arq.is_file():
         raise FileNotFoundError(f"Planilha não encontrada: {caminho_xlsx}")
@@ -468,13 +584,13 @@ def importar_planilha_historico(
                     and area_str not in ["ÁREA", "AREA", "ÁREA FISCAL", "AREA FISCAL"]
                     and area_str not in TERMOS_INVALIDOS_FISCAL
                 ):
-                    cep_limpo = normalizar_cep(cep_raw)
-                    if len(cep_limpo) == 8:
+                    cep_limpo_calc = normalizar_cep(cep_raw)
+                    if len(cep_limpo_calc) == 8:
                         bairro_limpo = normalizar_bairro(str(bairro_raw)) if bairro_raw else ""
-                        if cep_limpo not in ceps_consolidados:
-                            ceps_consolidados[cep_limpo] = (area_str, bairro_limpo)
-                        elif not ceps_consolidados[cep_limpo][1] and bairro_limpo:
-                            ceps_consolidados[cep_limpo] = (area_str, bairro_limpo)
+                        if cep_limpo_calc not in ceps_consolidados:
+                            ceps_consolidados[cep_limpo_calc] = (area_str, bairro_limpo)
+                        elif not ceps_consolidados[cep_limpo_calc][1] and bairro_limpo:
+                            ceps_consolidados[cep_limpo_calc] = (area_str, bairro_limpo)
 
             # 3. Consolidação de Protocolo para vre_backlog
             licenca_val = (
@@ -504,13 +620,6 @@ def importar_planilha_historico(
 
             status_raw_orig = str(row[idx_status - 1]).strip() if idx_status and idx_status <= len(row) and row[idx_status - 1] else ""
             status_raw = status_raw_orig.upper()
-            STATUS_CANONICOS = {
-                "DEFERIDO": "Deferido",
-                "INDEFERIDO": "Indeferido",
-                "CANCELADO": "Cancelado",
-                "CASSADO": "Cassado",
-                "EM ANDAMENTO": "Em Andamento",
-            }
             if status_raw in STATUS_CANONICOS:
                 status_calc = STATUS_CANONICOS[status_raw]
                 status_extra = STATUS_CANONICOS[status_raw]
@@ -748,7 +857,25 @@ def escanear_e_importar_planilhas_antigas(
     pasta_origem: Path | str | None = None,
     forcar: bool = False,
 ) -> dict[str, Any]:
-    """Varre 'Planilhas anteriores/' e a raiz em busca de planilhas antigas e importa tudo com deduplicação."""
+    """Varre 'Planilhas anteriores/' e a raiz em busca de planilhas antigas e importa tudo com deduplicação.
+
+    Ordem de Processamento:
+    1. Localiza planilhas em `Planilhas anteriores/`, na raiz e em `Documentação do projeto/Documentos de exemplo`.
+    2. Ordena os arquivos pela data de modificação (`st_mtime`) em ordem cronológica crescente.
+       Dessa forma, planilhas mais recentes sobrescrevem planilhas mais antigas durante os UPSERTs.
+    3. Retorna sumário consolidado com contadores agregados e detalhes de cada arquivo processado.
+
+    Args:
+        pasta_origem: Pasta customizada para varredura ou None para usar `PLANILHAS_ANTERIORES_DIR`.
+        forcar: Se True, força a reimportação mesmo se o hash do arquivo já foi registrado.
+
+    Returns:
+        dict[str, Any]: Estatísticas completas da carga em lote.
+
+    Complexity:
+        Tempo: O(F * L) onde F é a quantidade de planilhas e L a média de linhas por planilha.
+        Espaço: O(U) proporcional ao total consolidado de entidades únicas.
+    """
     dir_busca = Path(pasta_origem) if pasta_origem else PLANILHAS_ANTERIORES_DIR
 
     arquivos_candidatos: list[Path] = []
@@ -799,8 +926,8 @@ def escanear_e_importar_planilhas_antigas(
     total_fiscais = 0
     total_ceps = 0
     total_protocolos = 0
-    todos_meses = set()
-    detalhes = []
+    todos_meses: set[str] = set()
+    detalhes: list[dict[str, Any]] = []
 
     for arq in arquivos_candidatos:
         res = importar_planilha_historico(arq, forcar=forcar)

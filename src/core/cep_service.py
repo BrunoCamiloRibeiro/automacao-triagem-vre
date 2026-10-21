@@ -1,26 +1,66 @@
 """Módulo Dedicado para Mapeamento Dinâmico de CEP x Área.
 
-Gerencia o banco satélite `database/cep_areas.db`, implementando:
-1. Consulta de Área por CEP (`consultar_area_por_cep`).
-2. Cadastro e atualização de correlações (`registrar_area_cep`).
-3. Registro de CEPs não resolvidos (`registrar_cep_pendente`).
-4. Pipeline de fallback: Bairro normalizado -> CEP mapeado -> Registro de pendência.
+Gerencia o banco de dados satélite `database/cep_areas.db` e implementa o pipeline
+geográfico de 3 níveis da Inspetoria Fiscal da SMAURB:
+1. Nível 1 - Bairro Normalizado: Busca casamento exato do bairro na tabela `bairros_areas` do banco central.
+2. Nível 2 - CEP Mapeado: Fallback para consulta direta do CEP no banco `cep_areas.db`.
+3. Nível 3 - Fila de Pendências: Registro do CEP inconclusivo em `cep_pendentes` com contagem
+   de ocorrências e atualização retroativa automática (`backfill`) assim que o operador cadastra a área.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 from src.core.config import CEP_DB_PATH
-from src.core.database import db_transaction, get_cep_db, initialize_schema_if_needed
+from src.core.database import db_transaction, get_cep_db, get_triagem_db, initialize_schema_if_needed
 from src.core.normalizer import formatar_cep, normalizar_bairro, normalizar_cep
+
+# Dicionário canônico de harmonização de grafias de áreas fiscais
+HARMONIZAR_AREAS: dict[str, str] = {
+    "CIDADE CRIANÇA": "CIDADE DA CRIANÇA",
+    "SCHIMITT": "SCHMITT",
+}
 
 
 def ensure_cep_tables(conn: sqlite3.Connection) -> None:
-    """Garante que as tabelas de cep_mapeamento e cep_pendentes existam."""
+    """Garante que as tabelas cep_mapeamento e cep_pendentes existam no banco satélite.
+
+    Aplica o script DDL `schema_cep.sql` caso as tabelas ainda não tenham sido criadas.
+
+    Args:
+        conn: Conexão ativa com o banco SQLite `cep_areas.db`.
+
+    Complexity:
+        Tempo: O(1) - verificação de tabelas existentes no sqlite_master.
+        Espaço: O(1).
+    """
     initialize_schema_if_needed(conn, is_cep=True)
+
+
+def harmonizar_nome_area(area: str | None) -> str:
+    """Padroniza e harmoniza grafias de áreas fiscais para nomes oficiais institucionais.
+
+    Corrige desvios fonéticos ou variações históricas (ex: 'CIDADE CRIANÇA' -> 'CIDADE DA CRIANÇA',
+    'SCHIMITT' -> 'SCHMITT') mantendo integridade com as áreas de atuação dos fiscais.
+
+    Args:
+        area: Nome bruto ou formatado da Área Fiscal.
+
+    Returns:
+        str: Nome padronizado em caixa alta ou string vazia se nulo.
+
+    Complexity:
+        Tempo: O(1) - consulta em dicionário hash de 2 elementos.
+        Espaço: O(1).
+    """
+    if not area:
+        return ""
+    a = str(area).strip().upper()
+    return HARMONIZAR_AREAS.get(a, a)
 
 
 def consultar_area_por_cep(
@@ -28,9 +68,23 @@ def consultar_area_por_cep(
     conn: sqlite3.Connection | None = None,
     db_path: Path | str | None = None,
 ) -> str | None:
-    """Consulta a Área cadastrada para o CEP informado.
+    """Consulta a Área Fiscal cadastrada para o CEP informado.
 
-    Retorna o nome da Área (ex: 'CENTRAL', 'HB') ou None se não encontrado.
+    Realiza normalização prévia para 8 dígitos numéricos e executa busca indexada
+    em `cep_mapeamento`. Se não for fornecida conexão, gerencia abertura e fechamento
+    automático de forma segura.
+
+    Args:
+        cep: Código postal nos formatos '15050-090', '15050090' ou numérico.
+        conn: Conexão SQLite opcional pré-existente.
+        db_path: Caminho alternativo opcional para o banco de dados.
+
+    Returns:
+        str | None: Nome da Área cadastrada (ex: 'CENTRAL', 'HB') ou None se não encontrado/inválido.
+
+    Complexity:
+        Tempo: O(1) devido ao índice único B-Tree na coluna `cep_limpo`.
+        Espaço: O(1).
     """
     cep_limpo = normalizar_cep(cep)
     if not cep_limpo or len(cep_limpo) != 8:
@@ -57,18 +111,69 @@ def consultar_area_por_cep(
             conn.close()
 
 
-HARMONIZAR_AREAS: dict[str, str] = {
-    "CIDADE CRIANÇA": "CIDADE DA CRIANÇA",
-    "SCHIMITT": "SCHMITT",
-}
+def backfill_area_backlog_por_cep(
+    cep_limpo: str,
+    area: str,
+    triagem_conn: sqlite3.Connection | None = None,
+    triagem_db_path: Path | str | None = None,
+) -> int:
+    """Atualiza a Área no backlog para protocolos pendentes que possuam esse CEP e Área vazia.
 
+    Quando um operador cadastra a área de um CEP novo (seja via interface gráfica ou sincronização),
+    esta função varre o backlog central `vre_backlog` em busca de processos pendentes cujo endereço
+    possua esse mesmo CEP e atualiza atomicamente a coluna `area`.
 
-def harmonizar_nome_area(area: str | None) -> str:
-    """Padroniza grafias de áreas (ex: 'CIDADE CRIANÇA' -> 'CIDADE DA CRIANÇA')."""
-    if not area:
-        return ""
-    a = str(area).strip().upper()
-    return HARMONIZAR_AREAS.get(a, a)
+    Args:
+        cep_limpo: CEP normalizado com exatamente 8 dígitos.
+        area: Nome da Área Fiscal a ser atribuída.
+        triagem_conn: Conexão ativa opcional com `triagem_vre.db`.
+        triagem_db_path: Caminho alternativo para o banco central.
+
+    Returns:
+        int: Quantidade de protocolos que receberam a Área retroativamente.
+
+    Complexity:
+        Tempo: O(P) onde P é o número de protocolos pendentes sem área no backlog.
+        Espaço: O(P) para a lista de protocolos atualizados em memória.
+    """
+    close_conn = False
+    if triagem_conn is None:
+        try:
+            triagem_conn = get_triagem_db(triagem_db_path)
+            close_conn = True
+        except Exception:
+            return 0
+
+    try:
+        cur = triagem_conn.cursor()
+        cur.execute(
+            "SELECT protocolo_licenca, dados_extras_json FROM vre_backlog WHERE status = 'PENDENTE' AND (area IS NULL OR area = '');"
+        )
+        pendentes = cur.fetchall()
+        prots_para_atualizar: list[str] = []
+        for r in pendentes:
+            extras_raw = r["dados_extras_json"]
+            if extras_raw:
+                try:
+                    ex = json.loads(extras_raw)
+                    cep_ex = normalizar_cep(ex.get("Cep"))
+                    if cep_ex == cep_limpo:
+                        prots_para_atualizar.append(r["protocolo_licenca"])
+                except Exception:
+                    pass
+
+        if prots_para_atualizar:
+            area_final = harmonizar_nome_area(area)
+            with db_transaction(triagem_conn) as t_cur:
+                t_cur.executemany(
+                    "UPDATE vre_backlog SET area = ? WHERE protocolo_licenca = ?;",
+                    [(area_final, p) for p in prots_para_atualizar],
+                )
+            return len(prots_para_atualizar)
+        return 0
+    finally:
+        if close_conn:
+            triagem_conn.close()
 
 
 def registrar_area_cep(
@@ -81,9 +186,34 @@ def registrar_area_cep(
     triagem_conn: sqlite3.Connection | None = None,
     triagem_db_path: Path | str | None = None,
 ) -> bool:
-    """Insere ou atualiza uma correlação de CEP x Área.
+    """Insere ou atualiza uma correlação de CEP x Área Fiscal.
 
-    Remove o CEP da lista de pendências e atualiza registros pendentes no backlog.
+    Ações executadas atomicamente:
+    1. Normaliza e formata o CEP (8 dígitos e máscara).
+    2. Harmoniza o nome da área.
+    3. Executa UPSERT na tabela `cep_mapeamento` (atualizando `area`, `origem` e `atualizado_em`).
+    4. Remove o CEP da fila de `cep_pendentes` caso ele estivesse aguardando resolução.
+    5. Executa backfill retroativo no backlog central para preencher protocolos pendentes com esse CEP.
+
+    Args:
+        cep: CEP a ser registrado.
+        area: Nome da Área Fiscal correspondente.
+        bairro: Bairro de referência opcional.
+        origem: Identificador da fonte de cadastro ('MANUAL', 'IMPORTACAO', 'PLANILHA_ATIVA').
+        conn: Conexão opcional com `cep_areas.db`.
+        db_path: Caminho alternativo do banco de CEPs.
+        triagem_conn: Conexão opcional com `triagem_vre.db` para backfill.
+        triagem_db_path: Caminho alternativo do banco de triagem.
+
+    Returns:
+        bool: True em caso de sucesso.
+
+    Raises:
+        ValueError: Caso o CEP seja inválido (diferente de 8 dígitos) ou a Área seja vazia.
+
+    Complexity:
+        Tempo: O(1) de inserção no banco de CEPs + O(P) de backfill no backlog central.
+        Espaço: O(1).
     """
     cep_limpo = normalizar_cep(cep)
     if not cep_limpo or len(cep_limpo) != 8:
@@ -139,55 +269,6 @@ def registrar_area_cep(
             conn.close()
 
 
-def backfill_area_backlog_por_cep(
-    cep_limpo: str,
-    area: str,
-    triagem_conn: sqlite3.Connection | None = None,
-    triagem_db_path: Path | str | None = None,
-) -> int:
-    """Atualiza a Área no backlog para registros pendentes que possuam esse CEP e Área vazia."""
-    import json
-    from src.core.database import db_transaction, get_triagem_db
-
-    close_conn = False
-    if triagem_conn is None:
-        try:
-            triagem_conn = get_triagem_db(triagem_db_path)
-            close_conn = True
-        except Exception:
-            return 0
-
-    try:
-        cur = triagem_conn.cursor()
-        cur.execute(
-            "SELECT protocolo_licenca, dados_extras_json FROM vre_backlog WHERE status = 'PENDENTE' AND (area IS NULL OR area = '');"
-        )
-        pendentes = cur.fetchall()
-        prots_para_atualizar = []
-        for r in pendentes:
-            extras_raw = r["dados_extras_json"]
-            if extras_raw:
-                try:
-                    ex = json.loads(extras_raw)
-                    cep_ex = normalizar_cep(ex.get("Cep"))
-                    if cep_ex == cep_limpo:
-                        prots_para_atualizar.append(r["protocolo_licenca"])
-                except Exception:
-                    pass
-
-        if prots_para_atualizar:
-            with db_transaction(triagem_conn) as t_cur:
-                t_cur.executemany(
-                    "UPDATE vre_backlog SET area = ? WHERE protocolo_licenca = ?;",
-                    [(harmonizar_nome_area(area), p) for p in prots_para_atualizar],
-                )
-            return len(prots_para_atualizar)
-        return 0
-    finally:
-        if close_conn:
-            triagem_conn.close()
-
-
 def registrar_cep_pendente(
     cep: str | None,
     bairro: str | None = None,
@@ -195,7 +276,24 @@ def registrar_cep_pendente(
     conn: sqlite3.Connection | None = None,
     db_path: Path | str | None = None,
 ) -> None:
-    """Registra um CEP inconclusivo para posterior resolução administrativa."""
+    """Registra um CEP inconclusivo para posterior resolução administrativa.
+
+    Caso o CEP não seja resolvido nem por Bairro nem por CEP, esta rotina é acionada:
+    1. Verifica se o CEP já se encontra mapeado em `cep_mapeamento` (evitando duplicações).
+    2. Se não estiver mapeado, insere ou incrementa o contador `ocorrencias` em `cep_pendentes`.
+    3. Atualiza o carimbo de data/hora (`atualizado_em`) e dados de logradouro/bairro mais recentes.
+
+    Args:
+        cep: CEP não localizado.
+        bairro: Bairro original constante no pedido.
+        logradouro: Logradouro constante no pedido.
+        conn: Conexão com `cep_areas.db`.
+        db_path: Caminho alternativo do banco.
+
+    Complexity:
+        Tempo: O(1) de busca e upsert indexado.
+        Espaço: O(1).
+    """
     cep_limpo = normalizar_cep(cep)
     if not cep_limpo or len(cep_limpo) != 8:
         return
@@ -242,7 +340,20 @@ def remover_cep_mapeado(
     conn: sqlite3.Connection | None = None,
     db_path: Path | str | None = None,
 ) -> bool:
-    """Remove uma correlação de CEP mapeado."""
+    """Remove uma correlação de CEP mapeado do banco satélite.
+
+    Args:
+        cep: CEP a ser removido da tabela `cep_mapeamento`.
+        conn: Conexão opcional com `cep_areas.db`.
+        db_path: Caminho alternativo do banco.
+
+    Returns:
+        bool: True se o comando de exclusão foi executado com sucesso, False se CEP inválido.
+
+    Complexity:
+        Tempo: O(1) de deleção indexada.
+        Espaço: O(1).
+    """
     cep_limpo = normalizar_cep(cep)
     if not cep_limpo:
         return False
@@ -270,7 +381,26 @@ def listar_ceps_mapeados(
     conn: sqlite3.Connection | None = None,
     db_path: Path | str | None = None,
 ) -> list[dict[str, Any]]:
-    """Lista CEPs mapeados com suporte a múltiplos filtros (termo, área e bairro)."""
+    """Lista correlações de CEP mapeados com suporte a múltiplos filtros combinados.
+
+    Permite consulta textual por dígito de CEP ou nome de bairro, combinada com
+    filtros seletivos de Área Fiscal e Bairro.
+
+    Args:
+        filtro: Substring a buscar no CEP puro, CEP formatado ou bairro.
+        area_filtro: Área Fiscal específica ('CENTRAL', 'HB', etc.) ou 'Todas'.
+        bairro_filtro: Bairro específico ou 'Todos'.
+        limit: Limite máximo de registros a retornar (padrão 1000).
+        conn: Conexão SQLite opcional.
+        db_path: Caminho alternativo do banco.
+
+    Returns:
+        list[dict[str, Any]]: Lista de dicionários representando as linhas de `cep_mapeamento`.
+
+    Complexity:
+        Tempo: O(N) onde N é o número de registros filtrados (limitado a 1000).
+        Espaço: O(N).
+    """
     close_conn = False
     if conn is None:
         conn = get_cep_db(db_path)
@@ -314,7 +444,21 @@ def listar_bairros_mapeados(
     conn: sqlite3.Connection | None = None,
     db_path: Path | str | None = None,
 ) -> list[str]:
-    """Retorna lista alfabética de todos os bairros distintos cadastrados em cep_areas.db."""
+    """Retorna lista alfabética de todos os bairros distintos cadastrados em `cep_areas.db`.
+
+    Utilizado para popular dropdowns e comboboxes da interface gráfica administrativa.
+
+    Args:
+        conn: Conexão opcional com `cep_areas.db`.
+        db_path: Caminho alternativo do banco.
+
+    Returns:
+        list[str]: Lista ordenada com nomes de bairros em caixa alta.
+
+    Complexity:
+        Tempo: O(B log B) onde B é o número de bairros únicos em `cep_mapeamento`.
+        Espaço: O(B).
+    """
     close_conn = False
     if conn is None:
         conn = get_cep_db(db_path)
@@ -341,7 +485,19 @@ def listar_areas_mapeadas(
     conn: sqlite3.Connection | None = None,
     db_path: Path | str | None = None,
 ) -> list[str]:
-    """Retorna lista alfabética de todas as áreas distintas cadastradas em cep_areas.db."""
+    """Retorna lista alfabética de todas as áreas fiscais distintas cadastradas em `cep_areas.db`.
+
+    Args:
+        conn: Conexão opcional com `cep_areas.db`.
+        db_path: Caminho alternativo do banco.
+
+    Returns:
+        list[str]: Lista ordenada com nomes de áreas em caixa alta.
+
+    Complexity:
+        Tempo: O(A log A) onde A é o número de áreas cadastradas.
+        Espaço: O(A).
+    """
     close_conn = False
     if conn is None:
         conn = get_cep_db(db_path)
@@ -369,7 +525,23 @@ def listar_ceps_pendentes(
     conn: sqlite3.Connection | None = None,
     db_path: Path | str | None = None,
 ) -> list[dict[str, Any]]:
-    """Lista CEPs pendentes ordenados pelo número de ocorrências."""
+    """Lista CEPs pendentes ordenados decrescentemente pelo número de ocorrências.
+
+    Prioriza a exibição de CEPs que mais aparecem nos arquivos do VRE para que o
+    administrador resolva primeiro os pontos de maior impacto geográfico.
+
+    Args:
+        limit: Quantidade máxima de registros a retornar (padrão 500).
+        conn: Conexão opcional com `cep_areas.db`.
+        db_path: Caminho alternativo do banco.
+
+    Returns:
+        list[dict[str, Any]]: Lista de dicionários representando as linhas de `cep_pendentes`.
+
+    Complexity:
+        Tempo: O(P log P) de ordenação por ocorrências.
+        Espaço: O(P).
+    """
     close_conn = False
     if conn is None:
         conn = get_cep_db(db_path)
@@ -404,12 +576,27 @@ def resolver_area(
 
     Ordem de resolução:
     1. Tenta casar o Bairro normalizado na tabela `bairros_areas` de `triagem_vre.db`.
-       Se encontrar, retorna (area, 'BAIRRO').
-    2. Se inconclusivo ou não encontrado, recorre ao banco `cep_areas.db`.
-       Se encontrar, retorna (area, 'CEP').
+       Se encontrar, retorna (area_harmonizada, 'BAIRRO').
+    2. Se inconclusivo ou não encontrado, recorre ao banco satélite `cep_areas.db`.
+       Se encontrar, retorna (area_harmonizada, 'CEP').
     3. Se ambos falharem:
        Registra o CEP pendente em `cep_pendentes` (caso CEP seja válido).
        Retorna ("", "PENDENTE").
+
+    Args:
+        bairro_original: Nome do bairro extraído do cadastro do VRE.
+        cep_original: CEP extraído do cadastro do VRE.
+        triagem_conn: Conexão aberta com o banco central de triagem.
+        cep_conn: Conexão aberta opcional com o banco satélite de CEPs.
+        logradouro: Logradouro do pedido para registro auxiliar em caso de pendência.
+
+    Returns:
+        tuple[str, str]: Tupla contendo (nome_da_area, origem_da_resolucao).
+                         Exemplos: ('CENTRAL', 'BAIRRO'), ('HB', 'CEP'), ('', 'PENDENTE').
+
+    Complexity:
+        Tempo: O(1) - duas buscas indexadas em B-Tree no SQLite.
+        Espaço: O(1).
     """
     # 1. Tentativa via Bairro Normalizado
     bairro_norm = normalizar_bairro(bairro_original)
@@ -445,10 +632,24 @@ def reconciliar_areas_backlog(
     triagem_conn: sqlite3.Connection,
     cep_conn: sqlite3.Connection | None = None,
 ) -> int:
-    """Varre protocolos pendentes com Área vazia e resolve via Bairro ou CEP."""
-    import json
-    from src.core.database import db_transaction
+    """Varre protocolos pendentes com Área vazia e resolve via Bairro ou CEP.
 
+    Executada periodicamente ou após importações para auto-completar áreas de
+    protocolos pendentes cuja área foi descoberta após o cadastro original.
+    Respeita a flag `AreaLimpaManualmente` no JSON para não reescrever decisões
+    onde o usuário explicitamente apagou a área no Excel.
+
+    Args:
+        triagem_conn: Conexão ativa com o banco central de triagem.
+        cep_conn: Conexão ativa com o banco de CEPs.
+
+    Returns:
+        int: Total de protocolos cuja Área foi reconciliada e preenchida.
+
+    Complexity:
+        Tempo: O(P) onde P é o número de protocolos pendentes sem área no backlog.
+        Espaço: O(P) para a lista de tuplas de atualização.
+    """
     cur = triagem_conn.cursor()
     cur.execute(
         """
@@ -493,4 +694,3 @@ def reconciliar_areas_backlog(
             )
 
     return len(atualizados)
-

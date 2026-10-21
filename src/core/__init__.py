@@ -1,4 +1,15 @@
-"""Subpacote Core com serviços fundamentais, persistência e regras de negócio."""
+"""Subpacote Core com serviços fundamentais, persistência e regras de negócio.
+
+Contém os pilares de domínio da automação VRE:
+- `config`: Resolução dinâmica de diretórios, templates, bancos de dados e constantes visuais.
+- `database`: Gerenciamento transacional atômico e otimizações PRAGMA do SQLite.
+- `normalizer`: Higienização matemática de CNPJ, CEP, Bairro, CNAE e formatação de endereços.
+- `cep_service`: Mapeamento dinâmico e georreferenciamento de CEP x Área fiscal com fila de pendências.
+- `historico_importer`: Processador de deduplicação e carga em lote de planilhas históricas.
+- `excel_writer`: Motor de injeção atômica de dados (Plain Values) e formatação condicional OpenPyXL.
+"""
+
+from __future__ import annotations
 
 from src.core.config import (
     BASE_DIR,

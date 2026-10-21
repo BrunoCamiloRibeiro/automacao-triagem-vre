@@ -75,17 +75,13 @@ flowchart TD
 │   ├── workflows/ci.yml         # Pipeline de CI (Python 3.10, 3.11, 3.12)
 │   ├── ISSUE_TEMPLATE/          # Templates de Bug Report e Feature Request
 │   └── PULL_REQUEST_TEMPLATE.md # Template para submissão de código
-├── docs/                        # Documentação clássica de Engenharia de Software (UML 2.5)
+├── docs/                        # Documentação clássica de Engenharia de Software (UML 2.5 e Mermaid)
 │   ├── 00_INDICE.md             # Mapa e guia de navegação
-│   ├── 01_ESPECIFICACAO_REQUISITOS_SRS.md   # Requisitos IEEE 830 / ISO 29148
-│   ├── 02_ARQUITETURA_E_VISAO_4PLUS1.md     # Documento de Arquitetura (Modelo 4+1)
-│   ├── 03_MODELO_CASOS_DE_USO_UML.md        # Diagrama e especificações formais de Use Cases
-│   ├── 04_DIAGRAMA_CLASSES_DOMINIO_UML.md   # Diagrama de Classes UML completo
-│   ├── 05_DIAGRAMAS_SEQUENCIA_E_ATIVIDADE_UML.md # Sequências temporais e fluxos com swimlanes
-│   ├── 06_DIAGRAMA_ESTADOS_E_IMPLANTACAO_UML.md # Máquina de estados e topologia física
-│   ├── 07_MODELO_DADOS_RELACIONAL_MER.md    # MER/DER e Dicionário de Dados
-│   ├── 08_REGISTRO_DECISOES_ARQUITETURA_ADR.md # Decisões arquiteturais fundamentadas
-│   └── 09_MANUAL_OPERACIONAL_E_IMPLANTACAO.md  # Runbook operacional e suporte
+│   ├── 01-visao-geral-e-arquitetura.md # Arquitetura Limpa, Modelo 4+1, Stack e Componentes
+│   ├── 02-requisitos.md                # Requisitos Funcionais (RF01-26) e Não-Funcionais (RNF01-10)
+│   ├── 03-casos-de-uso.md              # Diagrama Mermaid e Especificações Formais (UC01-UC07)
+│   ├── 04-fluxos-e-modelagem.md        # Sequência, Classes, DER Relacional e Máquinas de Estados
+│   └── 05-guia-tecnico-e-manutencao.md # Runbook, Troubleshooting, Testes e ADRs (ADR-001 a 008)
 ├── src/                         # Código-fonte modular da aplicação
 │   ├── core/                    # Configuração, SQLite, Normalização, CEP e Excel Writer
 │   ├── runner/                  # Executável seco e importador de histórico
