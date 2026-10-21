@@ -38,10 +38,10 @@ PROJETO VRE/
 │       └── admin/
 ├── entrada_csv/                   # Recepção diária de arquivos do VRE
 │   └── processados/               # Repositório de arquivos já ingeridos
-├── Arquivados/                    # Armazenamento de planilhas de competências passadas
+├── Planilhas anteriores/         # Armazenamento de planilhas de competências passadas e backups
 ├── Planilha_Controle_VRE_Ativa.xlsx # Planilha viva de trabalho diário
-├── Iniciar_Triagem.bat            # Lançador interativo no terminal
-├── Iniciar_Silencioso.vbs         # Lançador em segundo plano (sem janela preta)
+├── Executar_Triagem.bat           # Lançador interativo no terminal
+├── Executar_Triagem_Silencioso.vbs# Lançador em segundo plano (sem janela preta)
 └── Painel_Administrativo.bat      # Lançador do GUI de governança
 ```
 
@@ -87,8 +87,8 @@ O comando realiza sequencialmente:
 7. Geração e gravação da nova `Planilha_Controle_VRE_Ativa.xlsx` com formatação condicional completa.
 
 #### Via Atalho Windows:
-- **`Iniciar_Triagem.bat`**: Invoca o script exibindo logs coloridos no console de comando do Windows.
-- **`Iniciar_Silencioso.vbs`**: Invoca o `pythonw.exe` em modo invisível (ideal para agendamento de tarefas no Windows Task Scheduler).
+- **`Executar_Triagem.bat`**: Invoca o script exibindo logs coloridos no console de comando do Windows.
+- **`Executar_Triagem_Silencioso.vbs`**: Invoca o `pythonw.exe` em modo invisível (ideal para agendamento de tarefas no Windows Task Scheduler).
 
 ---
 

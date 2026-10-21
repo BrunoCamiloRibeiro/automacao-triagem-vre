@@ -23,8 +23,6 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
-import os
-import re
 from pathlib import Path
 from typing import Any
 
@@ -33,9 +31,7 @@ import openpyxl
 from src.core.cep_service import reconciliar_areas_backlog, registrar_area_cep
 from src.core.config import (
     BASE_DIR,
-    CEP_DB_PATH,
     PLANILHAS_ANTERIORES_DIR,
-    TRIAGEM_DB_PATH,
 )
 from src.core.database import (
     db_transaction,

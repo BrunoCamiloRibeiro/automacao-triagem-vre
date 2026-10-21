@@ -33,14 +33,11 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.admin.archive_service import (
     alternar_status_competencia,
     aplicar_reorganizacao_planilha,
-    arquivar_competencia,
     buscar_historico_fiscais,
     definir_status_competencia,
     listar_competencias_status,
     listar_fiscais_cadastrados,
     obter_estatisticas_gerais,
-    obter_ultimos_atendimentos,
-    reativar_competencia,
 )
 from src.core.cep_service import (
     listar_areas_mapeadas,
@@ -54,7 +51,7 @@ from src.core.historico_importer import (
     escanear_e_importar_planilhas_antigas,
     importar_planilha_historico,
 )
-from src.core.normalizer import formatar_cep, formatar_cnpj, normalizar_cep, normalizar_cnpj
+from src.core.normalizer import formatar_cep, normalizar_cep
 
 # Carregamento seguro do Tkinter para tolerar ambientes headless (ex: servidores Linux de CI/CD)
 try:
@@ -73,6 +70,10 @@ class PainelAdminVRE:
 
         Args:
             root: Instância principal da janela Tkinter (`tk.Tk`).
+
+        Complexity:
+            Tempo: O(D + W) onde D é a carga de dados iniciais e W a árvore de widgets.
+            Espaço: O(W) para gerenciamento de componentes da interface gráfica.
         """
         self.root = root
         self.root.title("SMAURB - Painel Administrativo VRE & Fiscais")
@@ -95,7 +96,12 @@ class PainelAdminVRE:
         self.atualizar_tudo()
 
     def _carregar_logo(self) -> None:
-        """Carrega o brasão de São José do Rio Preto para o ícone e cabeçalho da janela."""
+        """Carrega o brasão de São José do Rio Preto para o ícone e cabeçalho da janela.
+
+        Complexity:
+            Tempo: O(1) - verificação de até 4 caminhos em disco.
+            Espaço: O(1) - memória de buffer do ícone PhotoImage.
+        """
         candidatos = [
             PROJECT_ROOT / "templates" / "logo_rio_preto.png",
             PROJECT_ROOT / "fbuild" / "Configurações" / "templates" / "logo_rio_preto.png",
@@ -115,7 +121,12 @@ class PainelAdminVRE:
                     pass
 
     def _criar_widgets(self) -> None:
-        """Constrói a hierarquia de widgets: cabeçalho azul, abas do notebook e status bar."""
+        """Constrói a hierarquia de widgets: cabeçalho azul, abas do notebook e status bar.
+
+        Complexity:
+            Tempo: O(W) onde W é o número total de componentes visuais instanciados.
+            Espaço: O(W).
+        """
         # Cabeçalho Institucional Azul SMAURB (#2C3E50)
         header_frame = tk.Frame(self.root, bg="#2C3E50", height=54)
         header_frame.pack(fill="x", side="top")
@@ -187,6 +198,10 @@ class PainelAdminVRE:
             mensagem: Texto explicativo exibido para o usuário.
             on_sucesso: Callback opcional chamado com o resultado de `target_fn`.
             on_erro: Callback opcional chamado caso `target_fn` levante exceção.
+
+        Complexity:
+            Tempo: O(1) de overhead na thread da interface gráfica para criação da thread daemon.
+            Espaço: O(1) - estrutura da janela modal Toplevel.
         """
         top = tk.Toplevel(self.root)
         top.title(titulo)
@@ -232,13 +247,25 @@ class PainelAdminVRE:
         resultado = [None]
         erro = [None]
 
-        def _worker():
+        def _worker() -> None:
+            """Executa target_fn na thread de trabalho e captura resultado ou exceção.
+
+            Complexity:
+                Tempo: Depende da complexidade intrínseca de `target_fn`.
+                Espaço: O(1).
+            """
             try:
                 resultado[0] = target_fn()
             except Exception as e:
                 erro[0] = e
             finally:
-                def _finalizar():
+                def _finalizar() -> None:
+                    """Encerra a modal e despacha os callbacks de sucesso ou erro na thread principal.
+
+                    Complexity:
+                        Tempo: O(1).
+                        Espaço: O(1).
+                    """
                     try:
                         pb.stop()
                         top.grab_release()
@@ -272,16 +299,55 @@ class PainelAdminVRE:
             tree: Instância do widget `ttk.Treeview`.
             col: Identificador da coluna clicada.
             reverse: Se True, inverte a ordem de classificação.
+
+        Complexity:
+            Tempo: O(N log N) onde N é a quantidade de nós exibidos na Treeview.
+            Espaço: O(N) para armazenamento transitório das tuplas de ordenação.
         """
         itens = [(tree.set(k, col), k) for k in tree.get_children("")]
 
         def _converter_chave(val: str) -> Any:
+            """Converte valor da célula em chave de ordenação apropriada (numérica, data ou texto).
+
+            Args:
+                val: Valor textual da célula.
+
+            Returns:
+                Any: Tupla discriminada `(prioridade, valor)` para ordenação estável.
+
+            Complexity:
+                Tempo: O(1).
+                Espaço: O(1).
+            """
             v = str(val).strip()
+            if not v:
+                return (2, "")
+
+            # 1. Datas no formato DD/MM/AAAA ou DD/MM/AAAA HH:MM:SS (ordena cronologicamente)
+            if len(v) >= 10 and v[2] == "/" and v[5] == "/":
+                partes = v.split(" ")
+                data_partes = partes[0].split("/")
+                if len(data_partes) == 3 and all(p.isdigit() for p in data_partes):
+                    dia, mes, ano = data_partes
+                    hora = partes[1] if len(partes) > 1 else ""
+                    return (0, f"{ano}-{mes}-{dia} {hora}".strip())
+
+            # 2. Números brasileiros com vírgula decimal (ex: '1.234,56' ou '50,00')
+            if "," in v:
+                v_br = v.replace(".", "").replace(",", ".")
+                try:
+                    return (0, float(v_br))
+                except ValueError:
+                    pass
+
+            # 3. Números decimais ou inteiros padrão (ex: '123' ou '1.5')
             try:
-                v_num = v.replace(".", "").replace(",", ".")
-                return (0, float(v_num))
+                if v.count(".") <= 1:
+                    return (0, float(v))
             except ValueError:
                 pass
+
+            # 4. Fallback lexicográfico insensível a maiúsculas/minúsculas
             return (1, v.lower())
 
         itens.sort(key=lambda t: _converter_chave(t[0]), reverse=reverse)
@@ -296,7 +362,12 @@ class PainelAdminVRE:
     # ABA 1: BUSCA DE HISTÓRICO DE FISCAIS
     # =========================================================================
     def _construir_aba_historico(self) -> None:
-        """Constrói os componentes da Aba 1 (Filtros, Botões de Importação e Tabela de Atendimentos)."""
+        """Constrói os componentes da Aba 1 (Filtros, Botões de Importação e Tabela de Atendimentos).
+
+        Complexity:
+            Tempo: O(1) - instanciação de frames, campos de busca e Treeview.
+            Espaço: O(1).
+        """
         top_frame = ttk.LabelFrame(self.tab_historico, text=" Pesquisa de Atendimentos Anteriores ", padding=10)
         top_frame.pack(fill="x", padx=10, pady=10)
 
@@ -375,7 +446,12 @@ class PainelAdminVRE:
         scroll_y.pack(side="right", fill="y")
 
     def atualizar_combobox_fiscais(self) -> None:
-        """Preenche o dropdown de fiscais com a lista de fiscais cadastrados."""
+        """Preenche o dropdown de fiscais com a lista de fiscais cadastrados.
+
+        Complexity:
+            Tempo: O(F) onde F é a quantidade de fiscais cadastrados no banco.
+            Espaço: O(F).
+        """
         try:
             fiscais = listar_fiscais_cadastrados()
             opcoes = ["Todos os Fiscais"] + fiscais
@@ -387,7 +463,15 @@ class PainelAdminVRE:
             pass
 
     def carregar_ultimos_fiscais(self, limit: int = 50) -> None:
-        """Exibe automaticamente os atendimentos mais recentes sem necessidade de pesquisa."""
+        """Exibe automaticamente os atendimentos mais recentes sem necessidade de pesquisa.
+
+        Args:
+            limit: Limite máximo de atendimentos a carregar (padrão: 50).
+
+        Complexity:
+            Tempo: O(limit) - consulta SQL indexada e inserção de linhas no Treeview.
+            Espaço: O(limit).
+        """
         fisc = self.cb_filtro_fiscal.get().strip() if hasattr(self, "cb_filtro_fiscal") else ""
         for item in self.tree_hist.get_children():
             self.tree_hist.delete(item)
@@ -408,7 +492,12 @@ class PainelAdminVRE:
         self.lbl_status.config(text=f"Exibindo os {len(resultados)} atendimentos mais recentes gravados no sistema.")
 
     def _limpar_busca_hist(self) -> None:
-        """Limpa filtros e campos de pesquisa do histórico."""
+        """Limpa filtros e campos de pesquisa do histórico.
+
+        Complexity:
+            Tempo: O(1) - limpeza de entradas de texto.
+            Espaço: O(1).
+        """
         self.ent_busca_hist.delete(0, tk.END)
         if hasattr(self, "cb_filtro_fiscal") and self.cb_filtro_fiscal["values"]:
             self.cb_filtro_fiscal.current(0)
@@ -416,7 +505,12 @@ class PainelAdminVRE:
         self.lbl_status.config(text="Filtros limpos. Exibindo atendimentos recentes.")
 
     def pesquisar_historico(self) -> None:
-        """Executa a busca de atendimentos e atualiza a Treeview."""
+        """Executa a busca de atendimentos e atualiza a Treeview.
+
+        Complexity:
+            Tempo: O(K) onde K é o limite de resultados retornados pela consulta SQL.
+            Espaço: O(K) para exibição dos resultados.
+        """
         termo = self.ent_busca_hist.get().strip()
         fisc = self.cb_filtro_fiscal.get().strip() if hasattr(self, "cb_filtro_fiscal") else ""
 
@@ -444,11 +538,34 @@ class PainelAdminVRE:
         self.lbl_status.config(text=f"{len(resultados)} atendimento(s) encontrado(s).")
 
     def importar_pasta_planilhas(self) -> None:
-        """Importa todas as planilhas da pasta 'Planilhas anteriores/' em thread separada."""
-        def _executar():
+        """Importa todas as planilhas da pasta 'Planilhas anteriores/' em thread separada.
+
+        Complexity:
+            Tempo: O(1) na thread principal (delega processamento em lote para thread de background).
+            Espaço: O(1).
+        """
+        def _executar() -> dict[str, Any]:
+            """Executa a importação em lote das planilhas da pasta de histórico.
+
+            Returns:
+                dict[str, Any]: Dicionário consolidado com total de arquivos, protocolos e fiscais.
+
+            Complexity:
+                Tempo: O(N * M) onde N é o número de arquivos e M a média de linhas lidas.
+                Espaço: O(P) para agregação de protocolos na memória.
+            """
             return escanear_e_importar_planilhas_antigas(forcar=True)
 
-        def _on_sucesso(res):
+        def _on_sucesso(res: dict[str, Any]) -> None:
+            """Processa o relatório consolidado de importação e notifica o usuário.
+
+            Args:
+                res: Resultado retornado por `_executar`.
+
+            Complexity:
+                Tempo: O(1) - renderização de messagebox e atualização da UI.
+                Espaço: O(1).
+            """
             if res["total_arquivos"] == 0:
                 messagebox.showinfo(
                     "Importação de Histórico",
@@ -478,7 +595,12 @@ class PainelAdminVRE:
         )
 
     def importar_arquivo_excel(self) -> None:
-        """Abre seletor para o usuário escolher uma planilha Excel e a importa sem travar a interface."""
+        """Abre seletor para o usuário escolher uma planilha Excel e a importa sem travar a interface.
+
+        Complexity:
+            Tempo: O(1) na thread da interface gráfica.
+            Espaço: O(1).
+        """
         caminho = filedialog.askopenfilename(
             title="Selecione a Planilha de Histórico",
             filetypes=[("Planilhas Excel", "*.xlsx *.xls"), ("Todos os arquivos", "*.*")],
@@ -486,10 +608,28 @@ class PainelAdminVRE:
         if not caminho:
             return
 
-        def _executar():
+        def _executar() -> dict[str, Any]:
+            """Executa a importação dos dados da planilha selecionada.
+
+            Returns:
+                dict[str, Any]: Dicionário com estatísticas de linhas, fiscais e CEPs inseridos.
+
+            Complexity:
+                Tempo: O(L) onde L é o número de linhas da planilha selecionada.
+                Espaço: O(L).
+            """
             return importar_planilha_historico(caminho, forcar=True)
 
-        def _on_sucesso(res):
+        def _on_sucesso(res: dict[str, Any]) -> None:
+            """Exibe resumo da importação da planilha avulsa e atualiza tabelas.
+
+            Args:
+                res: Resultado retornado por `_executar`.
+
+            Complexity:
+                Tempo: O(1) - diálogo messagebox e atualização da interface.
+                Espaço: O(1).
+            """
             if res.get("status") == "ERRO_LEITURA":
                 messagebox.showerror("Erro de Leitura", f"Falha ao ler o arquivo Excel:\n{res.get('mensagem')}")
                 return
@@ -516,7 +656,12 @@ class PainelAdminVRE:
     # ABA 2: GESTÃO DE CEP X ÁREA
     # =========================================================================
     def _construir_aba_cep(self) -> None:
-        """Constrói os componentes da Aba 2: Tabela de CEPs Mapeados, Formulário e Tabela de Pendências."""
+        """Constrói os componentes da Aba 2: Tabela de CEPs Mapeados, Formulário e Tabela de Pendências.
+
+        Complexity:
+            Tempo: O(1) - layout visual com PanedWindow e formulários.
+            Espaço: O(1).
+        """
         paned = ttk.PanedWindow(self.tab_cep, orient="horizontal")
         paned.pack(fill="both", expand=True, padx=10, pady=10)
 
@@ -633,7 +778,15 @@ class PainelAdminVRE:
         self.tree_pend.bind("<<TreeviewSelect>>", self._ao_selecionar_cep_pendente)
 
     def _obter_areas_disponiveis(self) -> list[str]:
-        """Obtém lista consolidada de Áreas conhecidas."""
+        """Obtém lista consolidada de Áreas conhecidas.
+
+        Returns:
+            list[str]: Lista ordenada de nomes canônicos de áreas fiscais.
+
+        Complexity:
+            Tempo: O(A log A) onde A é a quantidade de áreas no banco e conjunto estático.
+            Espaço: O(A).
+        """
         padrao = [
             "CENTRAL", "HB", "BOSQUE", "REPRESA", "CIDADE DA CRIANÇA",
             "CEU", "PINHEIRINHO", "VILA TONINHO", "SCHMITT", "TALHADO"
@@ -650,7 +803,12 @@ class PainelAdminVRE:
             return sorted(padrao)
 
     def atualizar_comboboxes_cep(self) -> None:
-        """Atualiza as opções dos dropdowns de Área e Bairro na aba de CEPs."""
+        """Atualiza as opções dos dropdowns de Área e Bairro na aba de CEPs.
+
+        Complexity:
+            Tempo: O(A + B) onde A é o total de áreas e B o total de bairros mapeados.
+            Espaço: O(A + B).
+        """
         try:
             areas = listar_areas_mapeadas()
             opcoes_area = ["Todas as Áreas"] + areas
@@ -669,7 +827,12 @@ class PainelAdminVRE:
             pass
 
     def _limpar_filtros_cep(self) -> None:
-        """Limpa filtros e campos de pesquisa de CEP."""
+        """Limpa filtros e campos de pesquisa de CEP.
+
+        Complexity:
+            Tempo: O(1).
+            Espaço: O(1).
+        """
         self.ent_filtro_cep.delete(0, tk.END)
         if hasattr(self, "cb_filtro_area") and self.cb_filtro_area["values"]:
             self.cb_filtro_area.current(0)
@@ -678,7 +841,15 @@ class PainelAdminVRE:
         self.carregar_ceps_mapeados()
 
     def _ao_selecionar_cep_mapeado(self, event: Any) -> None:
-        """Preenche o formulário com o CEP mapeado selecionado na tabela."""
+        """Preenche o formulário com o CEP mapeado selecionado na tabela.
+
+        Args:
+            event: Evento de seleção disparado pelo Treeview.
+
+        Complexity:
+            Tempo: O(1).
+            Espaço: O(1).
+        """
         sel = self.tree_cep.selection()
         if not sel:
             return
@@ -691,7 +862,15 @@ class PainelAdminVRE:
             self.ent_form_bairro.insert(0, vals[2])
 
     def _ao_selecionar_cep_pendente(self, event: Any) -> None:
-        """Preenche o formulário com o CEP pendente selecionado na tabela."""
+        """Preenche o formulário com o CEP pendente selecionado na tabela.
+
+        Args:
+            event: Evento de seleção disparado pelo Treeview.
+
+        Complexity:
+            Tempo: O(1).
+            Espaço: O(1).
+        """
         sel = self.tree_pend.selection()
         if not sel:
             return
@@ -703,13 +882,23 @@ class PainelAdminVRE:
             self.ent_form_bairro.insert(0, vals[2])
 
     def _limpar_form_cep(self) -> None:
-        """Limpa os campos do formulário de CEP."""
+        """Limpa os campos do formulário de CEP.
+
+        Complexity:
+            Tempo: O(1).
+            Espaço: O(1).
+        """
         self.ent_form_cep.delete(0, tk.END)
         self.cb_form_area.set("")
         self.ent_form_bairro.delete(0, tk.END)
 
     def carregar_ceps_mapeados(self) -> None:
-        """Carrega a tabela de CEPs mapeados respeitando os filtros ativos."""
+        """Carrega a tabela de CEPs mapeados respeitando os filtros ativos.
+
+        Complexity:
+            Tempo: O(C) onde C é a quantidade de CEPs retornados pela consulta filtrada.
+            Espaço: O(C).
+        """
         termo = self.ent_filtro_cep.get().strip()
         area_f = self.cb_filtro_area.get().strip() if hasattr(self, "cb_filtro_area") else ""
         bairro_f = self.cb_filtro_bairro.get().strip() if hasattr(self, "cb_filtro_bairro") else ""
@@ -735,7 +924,12 @@ class PainelAdminVRE:
             )
 
     def carregar_ceps_pendentes(self) -> None:
-        """Carrega a tabela de CEPs pendentes."""
+        """Carrega a tabela de CEPs pendentes.
+
+        Complexity:
+            Tempo: O(P) onde P é o número de CEPs pendentes no banco satélite.
+            Espaço: O(P).
+        """
         for item in self.tree_pend.get_children():
             self.tree_pend.delete(item)
 
@@ -752,7 +946,12 @@ class PainelAdminVRE:
             )
 
     def salvar_cep_form(self) -> None:
-        """Salva ou atualiza a correlação de CEP x Área preenchida no formulário."""
+        """Salva ou atualiza a correlação de CEP x Área preenchida no formulário.
+
+        Complexity:
+            Tempo: O(B) onde B é o número de protocolos pendentes atualizados retroativamente.
+            Espaço: O(1).
+        """
         cep_val = self.ent_form_cep.get().strip()
         area_val = self.cb_form_area.get().strip().upper()
         bairro_val = self.ent_form_bairro.get().strip()
@@ -789,7 +988,12 @@ class PainelAdminVRE:
             messagebox.showerror("Erro ao Salvar", str(e))
 
     def excluir_cep_form(self) -> None:
-        """Exclui a correlação de CEP informada no formulário."""
+        """Exclui a correlação de CEP informada no formulário.
+
+        Complexity:
+            Tempo: O(1) - exclusão por chave primária no banco SQLite.
+            Espaço: O(1).
+        """
         cep_val = self.ent_form_cep.get().strip()
         cep_limpo = normalizar_cep(cep_val)
         if not cep_limpo:
@@ -807,7 +1011,12 @@ class PainelAdminVRE:
     # ABA 3: ARQUIVAMENTO DE COMPETÊNCIAS
     # =========================================================================
     def _construir_aba_arquivamento(self) -> None:
-        """Constrói os componentes da Aba 3 (KPIs, Tabela de Competências e Botão de Aplicação)."""
+        """Constrói os componentes da Aba 3 (KPIs, Tabela de Competências e Botão de Aplicação).
+
+        Complexity:
+            Tempo: O(1) - layout visual de painéis de métricas e botões de ação.
+            Espaço: O(1).
+        """
         info_frame = ttk.LabelFrame(self.tab_arquivamento, text=" Controle de Visibilidade e Arquivamento por Mês ", padding=10)
         info_frame.pack(fill="x", padx=10, pady=(10, 5))
 
@@ -917,7 +1126,12 @@ class PainelAdminVRE:
         btn_atualizar.pack(side="right", padx=5)
 
     def carregar_lotes_arquivamento(self) -> None:
-        """Carrega e calcula KPIs do backlog e preenche a tabela de competências."""
+        """Carrega e calcula KPIs do backlog e preenche a tabela de competências.
+
+        Complexity:
+            Tempo: O(M) onde M é o número de meses cadastrados no banco central.
+            Espaço: O(M).
+        """
         stats = obter_estatisticas_gerais()
         self.lbl_kpi_total.config(text=f"Backlog Total: {stats['total_backlog']}")
         self.lbl_kpi_visiveis.config(text=f"Ativos na Planilha: {stats['protocolos_ativos_visiveis']}")
@@ -946,7 +1160,12 @@ class PainelAdminVRE:
             )
 
     def alternar_status_selecionado(self) -> None:
-        """Alterna o status do mês selecionado entre Ativo e Arquivado."""
+        """Alterna o status do mês selecionado entre Ativo e Arquivado.
+
+        Complexity:
+            Tempo: O(1) - atualização da flag booleana no SQLite.
+            Espaço: O(1).
+        """
         sel = self.tree_lotes.selection()
         if not sel:
             messagebox.showwarning("Aviso", "Selecione um mês de competência na tabela.")
@@ -962,7 +1181,12 @@ class PainelAdminVRE:
         )
 
     def arquivar_selecionado(self) -> None:
-        """Marca o mês selecionado como Arquivado."""
+        """Marca o mês selecionado como Arquivado.
+
+        Complexity:
+            Tempo: O(1).
+            Espaço: O(1).
+        """
         sel = self.tree_lotes.selection()
         if not sel:
             messagebox.showwarning("Aviso", "Selecione um mês de competência na tabela.")
@@ -977,7 +1201,12 @@ class PainelAdminVRE:
         )
 
     def reativar_selecionado(self) -> None:
-        """Reativa o mês selecionado (marca como Ativo / Visível)."""
+        """Reativa o mês selecionado (marca como Ativo / Visível).
+
+        Complexity:
+            Tempo: O(1).
+            Espaço: O(1).
+        """
         sel = self.tree_lotes.selection()
         if not sel:
             messagebox.showwarning("Aviso", "Selecione um mês de competência na tabela.")
@@ -992,7 +1221,12 @@ class PainelAdminVRE:
         )
 
     def aplicar_alteracoes_planilha(self) -> None:
-        """Aplica reorganização de competências, gera backup e recria a planilha ativa."""
+        """Aplica reorganização de competências, gera backup e recria a planilha ativa.
+
+        Complexity:
+            Tempo: O(1) na thread principal (delega I/O pesado de backup e geração da planilha para thread de background).
+            Espaço: O(1).
+        """
         if not messagebox.askyesno(
             "Aplicar Alterações e Atualizar Planilha",
             "Deseja atualizar a planilha de trabalho ativa?\n\n"
@@ -1002,10 +1236,28 @@ class PainelAdminVRE:
         ):
             return
 
-        def _executar():
+        def _executar() -> dict[str, Any]:
+            """Executa a rotina de sincronização, backup e regeração da planilha ativa.
+
+            Returns:
+                dict[str, Any]: Resumo contendo status, mensagem e total de linhas geradas.
+
+            Complexity:
+                Tempo: O(R) onde R é o total de linhas geradas no Excel.
+                Espaço: O(R) para montagem da planilha em memória.
+            """
             return aplicar_reorganizacao_planilha()
 
-        def _on_sucesso(res):
+        def _on_sucesso(res: dict[str, Any]) -> None:
+            """Notifica o operador sobre o sucesso da reorganização da planilha.
+
+            Args:
+                res: Dicionário de resultado retornado por `_executar`.
+
+            Complexity:
+                Tempo: O(1).
+                Espaço: O(1).
+            """
             messagebox.showinfo("Sucesso", res["mensagem"])
             self.atualizar_tudo()
             self.lbl_status.config(text=f"Planilha de trabalho atualizada ({res['linhas_geradas']} protocolos).")
@@ -1018,11 +1270,21 @@ class PainelAdminVRE:
         )
 
     def executar_arquivamento(self) -> None:
-        """Compatibilidade: executa arquivamento/alternância do mês selecionado."""
+        """Compatibilidade: executa arquivamento/alternância do mês selecionado.
+
+        Complexity:
+            Tempo: O(1).
+            Espaço: O(1).
+        """
         self.alternar_status_selecionado()
 
     def atualizar_tudo(self) -> None:
-        """Recarrega os dados em todas as abas e componentes da interface."""
+        """Recarrega os dados em todas as abas e componentes da interface.
+
+        Complexity:
+            Tempo: O(F + C + M) onde F é o total de fiscais, C o total de CEPs e M o total de competências.
+            Espaço: O(F + C + M).
+        """
         self.atualizar_combobox_fiscais()
         self.carregar_ultimos_fiscais()
         self.atualizar_comboboxes_cep()
@@ -1044,6 +1306,10 @@ def executar_modo_cli(args: argparse.Namespace) -> None:
 
     Args:
         args: Argumentos parseados via `argparse`.
+
+    Complexity:
+        Tempo: O(R) onde R é a complexidade intrínseca da operação solicitada.
+        Espaço: O(R).
     """
     if getattr(args, "buscar", None):
         termo = args.buscar.strip()
@@ -1144,7 +1410,12 @@ def executar_modo_cli(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    """Ponto de entrada do executável administrativo (config_vre.exe)."""
+    """Ponto de entrada do executável administrativo (config_vre.exe).
+
+    Complexity:
+        Tempo: O(1) de inicialização e parsing de argumentos CLI até início do mainloop GUI.
+        Espaço: O(W) para armazenamento de objetos de interface gráfica.
+    """
     parser = argparse.ArgumentParser(description="Painel Administrativo do VRE (SMAURB)")
     parser.add_argument("--cli", action="store_true", help="Executa em modo linha de comando (sem GUI)")
     parser.add_argument("--buscar", type=str, help="Pesquisa histórico por CNPJ ou Razão Social")

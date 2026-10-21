@@ -20,8 +20,6 @@ from pathlib import Path
 from typing import Any
 
 from src.core.config import (
-    BASE_DIR,
-    OUTPUT_XLSX_PATH,
     PLANILHAS_ANTERIORES_DIR,
     resolve_output_xlsx_path,
     resolve_template_path,

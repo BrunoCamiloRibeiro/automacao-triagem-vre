@@ -15,7 +15,6 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from src.core.config import CEP_DB_PATH
 from src.core.database import db_transaction, get_cep_db, get_triagem_db, initialize_schema_if_needed
 from src.core.normalizer import formatar_cep, normalizar_bairro, normalizar_cep
 

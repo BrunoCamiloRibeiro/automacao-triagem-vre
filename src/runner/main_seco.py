@@ -20,7 +20,6 @@ from __future__ import annotations
 import csv
 import datetime
 import json
-import os
 import shutil
 import sys
 from pathlib import Path
@@ -555,6 +554,10 @@ def main() -> None:
 
     Captura argumentos de linha de comando ou arrastamento de arquivo (.csv)
     e executa o processamento com captura defensiva de exceções gravadas em log.
+
+    Complexity:
+        Tempo: O(C + R) onde C é a leitura/sanitização do CSV e R a sincronização/geração do Excel.
+        Espaço: O(R) para armazenamento temporário das linhas em memória.
     """
     arg_csv = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else None
     try:

@@ -26,7 +26,7 @@ from typing import Any, Sequence
 import openpyxl
 from openpyxl.formatting.formatting import ConditionalFormattingList
 from openpyxl.formatting.rule import FormulaRule
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from src.core.cep_service import harmonizar_nome_area, registrar_area_cep
@@ -316,6 +316,25 @@ def _limpar_valor_celula(val: Any) -> str:
     return s
 
 
+def _extrair_coluna_planilha(row: tuple[Any, ...] | list[Any], pos_1based: int) -> str:
+    """Extrai e higieniza o valor textual de uma coluna posicional (1-based) da linha da planilha.
+
+    Args:
+        row: Tupla ou lista contendo os valores das células da linha.
+        pos_1based: Índice posicional da coluna iniciando em 1 (ex: Coluna B = 2).
+
+    Returns:
+        str: String higienizada sem espaços supérfluos ou string vazia se ausente.
+
+    Complexity:
+        Tempo: O(1) - acesso indexado em tupla/lista.
+        Espaço: O(1).
+    """
+    if pos_1based <= len(row):
+        return _limpar_valor_celula(row[pos_1based - 1])
+    return ""
+
+
 def sincronizar_planilha_ativa_com_banco(
     caminho_xlsx: Path | str | None = None,
     triagem_conn: sqlite3.Connection | None = None,
@@ -433,10 +452,7 @@ def sincronizar_planilha_ativa_com_banco(
             if not row or not any(row):
                 continue
 
-            def _col(pos_1based: int) -> str:
-                if pos_1based <= len(row):
-                    return _limpar_valor_celula(row[pos_1based - 1])
-                return ""
+            _col = lambda pos_1based: _extrair_coluna_planilha(row, pos_1based)
 
             status_excel = _col(2)
             fiscal_excel = _col(3)

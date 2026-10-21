@@ -245,6 +245,10 @@ def resolve_output_xlsx_path() -> Path:
 
     Returns:
         Path: Caminho do arquivo Excel de saída em produção.
+
+    Complexity:
+        Tempo: O(1) - leitura de variável de ambiente ou resolução de Path.
+        Espaço: O(1).
     """
     env_out = os.getenv("VRE_OUTPUT_XLSX_PATH")
     if env_out:

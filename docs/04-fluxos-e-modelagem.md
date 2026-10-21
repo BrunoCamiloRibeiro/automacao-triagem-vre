@@ -38,7 +38,7 @@ sequenceDiagram
     participant FS as Sistema de Arquivos
 
     Operador->>FS: Deposita CSV diário em entrada_csv/
-    Operador->>Runner: Executa iniciar_triagem.bat (ou main_seco.py)
+    Operador->>Runner: Executa Executar_Triagem.bat (ou main_seco.py)
     
     activate Runner
     Runner->>DB: inicializar_banco()

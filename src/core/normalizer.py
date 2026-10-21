@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Any, Sequence
+from typing import Any
 
 # ==============================================================================
 # EXPRESSÕES REGULARES PRÉ-COMPILADAS (OTIMIZAÇÃO DE PERFORMANCE)

@@ -22,10 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.core.config import BASE_DIR, PLANILHAS_ANTERIORES_DIR
-from src.core.historico_importer import (
-    escanear_e_importar_planilhas_antigas,
-    importar_planilha_historico,
-)
+from src.core.historico_importer import importar_planilha_historico
 
 
 def main() -> None:
@@ -34,6 +31,10 @@ def main() -> None:
     Suporta passagem opcional de caminho por argumento (`sys.argv[1]`)
     ou varredura automática em `Planilhas anteriores/` e na raiz.
     Exibe estatísticas de processamento no terminal e tempo total transcorrido.
+
+    Complexity:
+        Tempo: O(N * M) onde N é a quantidade de planilhas e M o total de linhas lidas.
+        Espaço: O(P) para agregação de protocolos e histórico em memória.
     """
     print("=" * 78)
     print(" SMAURB / INSPETORIA FISCAL - CARGA DE PLANILHAS HISTÓRICAS")
