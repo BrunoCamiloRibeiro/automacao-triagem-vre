@@ -869,3 +869,269 @@ def buscar_historico_fiscais(
     finally:
         if close_conn:
             conn.close()
+
+
+def normalizar_data_filtro(data_str: str) -> str:
+    """Normaliza datas nos formatos DD/MM/AAAA ou AAAA-MM-DD para o padrão ISO AAAA-MM-DD.
+
+    Args:
+        data_str: String representando uma data (ex: '21/10/2026' ou '2026-10-21').
+
+    Returns:
+        str: Data harmonizada no formato 'AAAA-MM-DD' ou string vazia se nula/inválida.
+
+    Complexity:
+        Tempo: O(1).
+        Espaço: O(1).
+    """
+    if not data_str:
+        return ""
+    d = str(data_str).strip()
+    if "/" in d:
+        partes = d.split("/")
+        if len(partes) == 3:
+            if len(partes[0]) == 4:
+                return f"{partes[0]}-{partes[1].zfill(2)}-{partes[2].zfill(2)}"
+            elif len(partes[2]) == 4:
+                return f"{partes[2]}-{partes[1].zfill(2)}-{partes[0].zfill(2)}"
+    elif "-" in d:
+        partes = d.split("-")
+        if len(partes) == 3:
+            if len(partes[0]) == 4:
+                return f"{partes[0]}-{partes[1].zfill(2)}-{partes[2].zfill(2)}"
+            elif len(partes[2]) == 4:
+                return f"{partes[2]}-{partes[1].zfill(2)}-{partes[0].zfill(2)}"
+    return d
+
+
+def listar_dias_importados(conn: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
+    """Lista todas as datas de importação registradas no backlog com seus totais consolidados.
+
+    Args:
+        conn: Conexão SQLite opcional. Se None, gerencia ciclo de vida próprio.
+
+    Returns:
+        list[dict[str, Any]]: Lista ordenada por data decrescente contendo:
+            - data_importacao: Data em formato ISO 'AAAA-MM-DD'
+            - data_formatada: Data em formato brasileiro 'DD/MM/AAAA'
+            - total: Total de protocolos da data
+            - pendentes: Total de protocolos com status 'PENDENTE'
+            - distribuidos: Total de protocolos com status 'DISTRIBUIDO'
+            - finalizados: Total de protocolos com status 'FINALIZADO'
+            - competencias: Mês(es) de competência associados
+
+    Complexity:
+        Tempo: O(D) onde D é o número de dias distintos no backlog.
+        Espaço: O(D).
+    """
+    close_conn = False
+    if conn is None:
+        conn = get_triagem_db()
+        close_conn = True
+
+    try:
+        initialize_schema_if_needed(conn, is_cep=False)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                data_importacao,
+                COUNT(*) as total,
+                SUM(CASE WHEN status = 'PENDENTE' THEN 1 ELSE 0 END) as pendentes,
+                SUM(CASE WHEN status = 'DISTRIBUIDO' THEN 1 ELSE 0 END) as distribuidos,
+                SUM(CASE WHEN status = 'FINALIZADO' THEN 1 ELSE 0 END) as finalizados,
+                GROUP_CONCAT(DISTINCT mes_competencia) as competencias
+            FROM vre_backlog
+            WHERE data_importacao IS NOT NULL AND TRIM(data_importacao) != ''
+            GROUP BY data_importacao
+            ORDER BY data_importacao DESC;
+            """
+        )
+        resultados: list[dict[str, Any]] = []
+        for r in cur.fetchall():
+            d_raw = str(r["data_importacao"]).strip()
+            # Converte para formato brasileiro se for ISO
+            if len(d_raw) == 10 and d_raw[4] == "-" and d_raw[7] == "-":
+                d_fmt = f"{d_raw[8:10]}/{d_raw[5:7]}/{d_raw[:4]}"
+            else:
+                d_fmt = d_raw
+
+            resultados.append(
+                {
+                    "data_importacao": d_raw,
+                    "data_formatada": d_fmt,
+                    "total": int(r["total"] or 0),
+                    "pendentes": int(r["pendentes"] or 0),
+                    "distribuidos": int(r["distribuidos"] or 0),
+                    "finalizados": int(r["finalizados"] or 0),
+                    "competencias": str(r["competencias"] or ""),
+                }
+            )
+        return resultados
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def apagar_dia_banco(
+    data_alvo: str,
+    conn: sqlite3.Connection | None = None,
+    atualizar_planilha: bool = True,
+    saida_xlsx: Path | str | None = None,
+    caminho_template: Path | str | None = None,
+) -> dict[str, Any]:
+    """Exclui todos os protocolos de uma data específica do banco central (`triagem_vre.db`).
+
+    Projetado especificamente para expurgar remessas diárias (arquivos CSV) que foram
+    carregadas incorretamente, de forma duplicada ou com dados corrompidos.
+
+    Fluxo Operacional Transacional:
+    1. Harmonização da data informada para ISO 'AAAA-MM-DD' e formato nacional 'DD/MM/AAAA'.
+    2. Sincronização prévia de edições manuais feitas no Excel ativo para garantir a preservação
+       de eventuais alterações em outros dias antes do expurgo.
+    3. Exclusão atômica de todos os protocolos daquela data em `vre_backlog`.
+    4. Remoção de competências órfãs de `controle_competencias` que ficaram sem protocolos.
+    5. Se `atualizar_planilha=True`:
+       - Gera backup datado da planilha em uso em `Planilhas anteriores/`.
+       - Reconstrói a `Planilha_Controle_VRE_Ativa.xlsx` refletindo a exclusão imediatamente.
+       - Atualiza o registro de hash institucional.
+
+    Args:
+        data_alvo: Data a excluir (aceita 'AAAA-MM-DD' ou 'DD/MM/AAAA').
+        conn: Conexão SQLite opcional. Se None, gerencia ciclo de vida próprio.
+        atualizar_planilha: Se True, recria a planilha ativa no disco.
+        saida_xlsx: Caminho da planilha de trabalho ativa.
+        caminho_template: Caminho do template Excel.
+
+    Returns:
+        dict[str, Any]: Sumário contendo status, total de registros removidos, datas e mensagem.
+
+    Complexity:
+        Tempo: O(N_dia + N_ativos * Colunas) para exclusão e regeração da planilha ativa.
+        Espaço: O(N_ativos * Colunas).
+    """
+    data_limpa = str(data_alvo or "").strip()
+    data_iso = normalizar_data_filtro(data_limpa)
+    if not data_iso:
+        return {
+            "sucesso": False,
+            "removidos": 0,
+            "data_alvo": data_limpa,
+            "mensagem": "Data informada é inválida ou vazia.",
+        }
+
+    # Gera representações possíveis no banco para garantir casamento exato
+    if len(data_iso) == 10 and data_iso[4] == "-" and data_iso[7] == "-":
+        data_br = f"{data_iso[8:10]}/{data_iso[5:7]}/{data_iso[:4]}"
+    else:
+        data_br = data_iso
+
+    candidatos = list({data_iso, data_br, data_limpa})
+    placeholders = ", ".join(["?"] * len(candidatos))
+    params = tuple(candidatos)
+
+    close_conn = False
+    if conn is None:
+        conn = get_triagem_db()
+        close_conn = True
+
+    try:
+        initialize_schema_if_needed(conn, is_cep=False)
+        garantir_tabela_controle(conn)
+
+        p_saida = Path(saida_xlsx) if saida_xlsx else resolve_output_xlsx_path()
+        p_tpl = Path(caminho_template) if caminho_template else resolve_template_path()
+
+        # 1. Sincroniza edições manuais existentes antes da exclusão
+        if atualizar_planilha:
+            sincronizar_planilha_ativa_com_banco(caminho_xlsx=p_saida, triagem_conn=conn)
+
+        # 2. Verifica quantos registros casam com a data informada
+        cur = conn.cursor()
+        cur.execute(f"SELECT COUNT(*) FROM vre_backlog WHERE data_importacao IN ({placeholders});", params)
+        total_remover = cur.fetchone()[0]
+
+        if total_remover == 0:
+            return {
+                "sucesso": False,
+                "removidos": 0,
+                "data_iso": data_iso,
+                "data_formatada": data_br,
+                "mensagem": f"Nenhum protocolo encontrado no banco para a data '{data_br}'.",
+            }
+
+        # 3. Exclusão atômica em transação protegida
+        with db_transaction(conn) as cur_del:
+            cur_del.execute(f"DELETE FROM vre_backlog WHERE data_importacao IN ({placeholders});", params)
+            # Remove competências órfãs que possam ter ficado com 0 protocolos
+            cur_del.execute(
+                """
+                DELETE FROM controle_competencias
+                WHERE mes_competencia NOT IN (
+                    SELECT DISTINCT mes_competencia FROM vre_backlog
+                    WHERE mes_competencia IS NOT NULL AND TRIM(mes_competencia) != ''
+                );
+                """
+            )
+
+        # 4. Atualização da planilha ativa em disco
+        backup_path = None
+        linhas_geradas = 0
+        planilha_atualizada = False
+
+        if atualizar_planilha:
+            backup_path = fazer_backup_planilha_ativa(caminho_planilha=p_saida)
+            limpar_indeferidos_e_normalizar_backlog(conn)
+
+            cur_sel = conn.cursor()
+            cur_sel.execute(
+                """
+                SELECT
+                    protocolo_licenca, protocolo_sil, cnpj_limpo, cnpj_formatado,
+                    nome_empresarial, mes_competencia, data_importacao,
+                    bairro_original, area, cnaes_licenciadas, fiscal_atribuido,
+                    flag_restricao, flag_noturno, tipo_servico, status,
+                    data_finalizacao, dados_extras_json
+                FROM vre_backlog
+                WHERE mes_competencia NOT IN (
+                    SELECT mes_competencia FROM controle_competencias WHERE arquivado = 1
+                )
+                ORDER BY mes_competencia ASC, data_importacao ASC, protocolo_sil ASC;
+                """
+            )
+            linhas_backlog = [dict(r) for r in cur_sel.fetchall()]
+            linhas_geradas = len(linhas_backlog)
+
+            try:
+                gerar_planilha_trabalho(
+                    registros_backlog=linhas_backlog,
+                    caminho_saida=p_saida,
+                    caminho_template=p_tpl,
+                )
+                registrar_hash_planilha_gerada(p_saida, conn)
+                planilha_atualizada = True
+            except PermissionError:
+                planilha_atualizada = False
+
+        msg = f"Sucesso: {total_remover} protocolo(s) da data {data_br} foram excluídos do banco de dados."
+        if atualizar_planilha:
+            if planilha_atualizada:
+                msg += f"\n• Planilha de trabalho ativa atualizada ({linhas_geradas} protocolos restantes)."
+            else:
+                msg += "\n• [AVISO] A planilha ativa está aberta no Excel e não pôde ser sobrescrita. Feche o Excel e clique em 'Aplicar Alterações'."
+        if backup_path:
+            msg += f"\n• Cópia de segurança salva em: Planilhas anteriores/{backup_path.name}"
+
+        return {
+            "sucesso": True,
+            "removidos": total_remover,
+            "data_iso": data_iso,
+            "data_formatada": data_br,
+            "linhas_planilha_ativa": linhas_geradas,
+            "backup_criado": str(backup_path) if backup_path else None,
+            "planilha_atualizada": planilha_atualizada,
+            "mensagem": msg,
+        }
+    finally:
+        if close_conn:
+            conn.close()

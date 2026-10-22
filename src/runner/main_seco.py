@@ -12,7 +12,7 @@ Projetado para execução instantânea, silenciosa e com zero dependências de i
    - Atribuição geográfica de Área por Bairro com fallback para `cep_areas.db`.
 4. Inserção protegida no banco (`INSERT OR IGNORE` no `protocolo_licenca`).
 5. Recuperação dos protocolos de todas as competências ativas (não arquivadas).
-6. Exportação atômica da `Planilha_Controle_VRE_Ativa.xlsx` e arquivamento do CSV em `processados/`.
+6. Exportação atômica da `Planilha_Controle_VRE_Ativa.xlsx` e remoção do CSV processado.
 """
 
 from __future__ import annotations
@@ -216,6 +216,30 @@ def ler_linhas_csv(caminho_csv: Path) -> list[dict[str, str]]:
     return registros
 
 
+def limpar_csvs_processados() -> int:
+    """Remove arquivos CSV antigos acumulados na pasta de processados ou de entrada.
+
+    Garante que nenhum CSV legado permaneça no disco após a execução.
+
+    Returns:
+        int: Quantidade de arquivos CSV removidos.
+
+    Complexity:
+        Tempo: O(F) onde F é a quantidade de arquivos encontrados.
+        Espaço: O(1).
+    """
+    total_removidos = 0
+    if PROCESSADOS_CSV_DIR.exists():
+        for f in PROCESSADOS_CSV_DIR.glob("*.csv"):
+            if f.is_file() and "tests" not in f.parts and "test_data" not in f.parts:
+                try:
+                    f.unlink()
+                    total_removidos += 1
+                except Exception:
+                    pass
+    return total_removidos
+
+
 def processar_fluxo_seco(
     caminho_csv: Path | str | None = None,
     saida_xlsx: Path | str | None = None,
@@ -241,7 +265,7 @@ def processar_fluxo_seco(
     6. Reconciliação automática de áreas e saneamento de indeferidos.
     7. Consulta de todos os protocolos dos meses ativos (não arquivados).
     8. Backup preventivo da planilha anterior em `Planilhas anteriores/`.
-    9. Geração da nova `Planilha_Controle_VRE_Ativa.xlsx` e arquivamento do CSV em `processados/`.
+    9. Geração da nova `Planilha_Controle_VRE_Ativa.xlsx` e remoção do CSV processado.
 
     Args:
         caminho_csv: Caminho opcional do arquivo CSV. Se None, busca automaticamente.
@@ -518,7 +542,7 @@ def processar_fluxo_seco(
     )
     registrar_hash_planilha_gerada(saida_final, conn_triagem)
 
-    # Move para processados apenas em produção (nunca move arquivos de teste)
+    # Remove o arquivo CSV após execução com sucesso (nunca remove arquivos de teste)
     if arquivo_csv is not None and arquivo_csv.exists():
         caminho_res = arquivo_csv.resolve()
         if "tests" not in caminho_res.parts and "test_data" not in caminho_res.parts:
@@ -527,15 +551,15 @@ def processar_fluxo_seco(
                 or ENTRADA_CSV_DIR.resolve() in caminho_res.parents
                 or caminho_res.parent == ENTRADA_CSV_DIR.resolve()
             ):
-                PROCESSADOS_CSV_DIR.mkdir(parents=True, exist_ok=True)
-                timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                nome_dest = f"{arquivo_csv.stem}_{timestamp_str}{arquivo_csv.suffix}"
                 try:
-                    shutil.move(str(arquivo_csv), str(PROCESSADOS_CSV_DIR / nome_dest))
+                    arquivo_csv.unlink()
                     if not silencioso:
-                        print(f"    [✓] Arquivo '{arquivo_csv.name}' arquivado em Configurações/entrada_csv/processados/")
+                        print(f"    [✓] Arquivo '{arquivo_csv.name}' removido após a execução com sucesso.")
                 except Exception:
                     pass
+
+    # Garante a limpeza de quaisquer CSVs legados acumulados em processados/
+    limpar_csvs_processados()
 
     conn_triagem.close()
     conn_cep.close()

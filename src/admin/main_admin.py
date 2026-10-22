@@ -32,11 +32,14 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.admin.archive_service import (
     alternar_status_competencia,
+    apagar_dia_banco,
     aplicar_reorganizacao_planilha,
     buscar_historico_fiscais,
     definir_status_competencia,
     listar_competencias_status,
+    listar_dias_importados,
     listar_fiscais_cadastrados,
+    normalizar_data_filtro,
     obter_estatisticas_gerais,
 )
 from src.core.cep_service import (
@@ -52,6 +55,7 @@ from src.core.historico_importer import (
     importar_planilha_historico,
 )
 from src.core.normalizer import formatar_cep, normalizar_cep
+from src.runner.main_seco import limpar_csvs_processados
 
 # Carregamento seguro do Tkinter para tolerar ambientes headless (ex: servidores Linux de CI/CD)
 try:
@@ -164,6 +168,11 @@ class PainelAdminVRE:
         self.tab_arquivamento = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_arquivamento, text="  📦 Arquivamento de Competências  ")
         self._construir_aba_arquivamento()
+
+        # 4. Aba Remessas por Dia / Excluir
+        self.tab_dias = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_dias, text="  📅 Remessas por Dia / Excluir  ")
+        self._construir_aba_dias()
 
         # Barra de status inferior
         self.lbl_status = tk.Label(
@@ -1122,6 +1131,13 @@ class PainelAdminVRE:
         )
         btn_aplicar.pack(side="left", padx=15)
 
+        btn_ir_excluir = ttk.Button(
+            botoes_frame,
+            text="🗑️ Excluir Dia (CSV)...",
+            command=lambda: self.notebook.select(self.tab_dias),
+        )
+        btn_ir_excluir.pack(side="left", padx=5)
+
         btn_atualizar = ttk.Button(botoes_frame, text="Atualizar Lista", command=self.carregar_lotes_arquivamento)
         btn_atualizar.pack(side="right", padx=5)
 
@@ -1278,12 +1294,224 @@ class PainelAdminVRE:
         """
         self.alternar_status_selecionado()
 
+    def _construir_aba_dias(self) -> None:
+        """Constrói os componentes da Aba 4 (Gestão e Exclusão de Remessas Diárias por CSV).
+
+        Complexity:
+            Tempo: O(1) - construção estática dos widgets.
+            Espaço: O(1).
+        """
+        info_frame = ttk.LabelFrame(
+            self.tab_dias,
+            text=" Gerenciamento e Exclusão de Remessas Diárias (CSV do VRE) ",
+            padding=10,
+        )
+        info_frame.pack(fill="x", padx=10, pady=(10, 5))
+
+        lbl_desc = ttk.Label(
+            info_frame,
+            text=(
+                "• O sistema VRE exporta novos protocolos diariamente em lotes CSV por data de atendimento.\n"
+                "• Caso um arquivo CSV tenha sido subido incorretamente ou com dados errados, "
+                "selecione a data abaixo para expurgar todos os protocolos daquele dia do banco de dados.\n"
+                "• A exclusão atualiza a planilha de trabalho ativa de forma imediata e "
+                "salva uma cópia de segurança preventiva em 'Planilhas anteriores/'.\n"
+                "• Arquivos CSV antigos não são mantidos no disco: após executados, são removidos automaticamente."
+            ),
+            font=("Arial", 9),
+            justify="left",
+        )
+        lbl_desc.pack(fill="x", padx=5, pady=2)
+
+        # Tabela de Remessas Diárias
+        tabela_frame = ttk.LabelFrame(
+            self.tab_dias,
+            text=" Remessas Diárias Registradas no Banco de Dados ",
+            padding=10,
+        )
+        tabela_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        cols_dias = ("data_br", "data_iso", "competencia", "total", "pendentes", "distribuidos", "finalizados")
+        self.tree_dias = ttk.Treeview(tabela_frame, columns=cols_dias, show="headings", selectmode="browse")
+
+        rotulos_dias = {
+            "data_br": ("Data (DD/MM/AAAA)", 140, "center"),
+            "data_iso": ("Data ISO (AAAA-MM-DD)", 140, "center"),
+            "competencia": ("Competência", 120, "center"),
+            "total": ("Total Protocolos", 120, "center"),
+            "pendentes": ("Pendentes", 100, "center"),
+            "distribuidos": ("Distribuídos", 100, "center"),
+            "finalizados": ("Finalizados", 100, "center"),
+        }
+        for c, (txt, w, anch) in rotulos_dias.items():
+            self.tree_dias.heading(
+                c,
+                text=txt,
+                command=lambda col=c: self.ordenar_treeview(self.tree_dias, col, False),
+            )
+            self.tree_dias.column(c, width=w, anchor=anch)
+
+        scroll_dias = ttk.Scrollbar(tabela_frame, orient="vertical", command=self.tree_dias.yview)
+        self.tree_dias.configure(yscrollcommand=scroll_dias.set)
+        self.tree_dias.pack(side="left", fill="both", expand=True)
+        scroll_dias.pack(side="right", fill="y")
+
+        self.tree_dias.bind("<<TreeviewSelect>>", self._on_selecionar_dia)
+        self.tree_dias.bind("<Double-1>", lambda e: self.excluir_dia_selecionado())
+
+        # Painel Inferior de Controles e Ação de Exclusão
+        controles_frame = ttk.LabelFrame(
+            self.tab_dias,
+            text=" Painel de Exclusão por Dia ",
+            padding=10,
+        )
+        controles_frame.pack(fill="x", padx=10, pady=8)
+
+        lbl_data = ttk.Label(
+            controles_frame,
+            text="Data Selecionada (DD/MM/AAAA ou AAAA-MM-DD):",
+            font=("Arial", 9, "bold"),
+        )
+        lbl_data.pack(side="left", padx=5)
+
+        self.ent_data_excluir = ttk.Entry(controles_frame, width=16, font=("Arial", 10))
+        self.ent_data_excluir.pack(side="left", padx=5)
+
+        btn_excluir = tk.Button(
+            controles_frame,
+            text="🗑️ Excluir Protocolos Deste Dia",
+            bg="#C0392B",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            padx=16,
+            pady=4,
+            command=self.excluir_dia_selecionado,
+        )
+        btn_excluir.pack(side="left", padx=12)
+
+        btn_limpar_csv = ttk.Button(
+            controles_frame,
+            text="🧹 Limpar CSVs em Disco",
+            command=self.limpar_csvs_disco,
+        )
+        btn_limpar_csv.pack(side="left", padx=5)
+
+        btn_atualizar = ttk.Button(
+            controles_frame,
+            text="Atualizar Lista",
+            command=self.carregar_dias_importados,
+        )
+        btn_atualizar.pack(side="right", padx=5)
+
+    def carregar_dias_importados(self) -> None:
+        """Carrega e preenche a tabela de remessas diárias do banco central.
+
+        Complexity:
+            Tempo: O(D) onde D é o número de datas distintas no backlog.
+            Espaço: O(D).
+        """
+        for item in self.tree_dias.get_children():
+            self.tree_dias.delete(item)
+
+        dias = listar_dias_importados()
+        for d in dias:
+            self.tree_dias.insert(
+                "",
+                "end",
+                values=(
+                    d["data_formatada"],
+                    d["data_importacao"],
+                    d["competencias"],
+                    d["total"],
+                    d["pendentes"],
+                    d["distribuidos"],
+                    d["finalizados"],
+                ),
+            )
+
+    def _on_selecionar_dia(self, event: Any = None) -> None:
+        """Preenche o campo de exclusão com a data da linha selecionada na Treeview.
+
+        Complexity:
+            Tempo: O(1).
+            Espaço: O(1).
+        """
+        sel = self.tree_dias.selection()
+        if not sel:
+            return
+        vals = self.tree_dias.item(sel[0], "values")
+        if vals:
+            self.ent_data_excluir.delete(0, tk.END)
+            self.ent_data_excluir.insert(0, vals[0])
+
+    def excluir_dia_selecionado(self) -> None:
+        """Solicita confirmação estrita e expurga todos os protocolos da data informada.
+
+        Complexity:
+            Tempo: O(1) na thread GUI (delega processamento pesado para thread com loading).
+            Espaço: O(1).
+        """
+        data_digitada = self.ent_data_excluir.get().strip()
+        if not data_digitada:
+            messagebox.showwarning("Aviso", "Selecione uma remessa na tabela ou digite a data que deseja excluir.")
+            return
+
+        total_previsto = "?"
+        sel = self.tree_dias.selection()
+        if sel:
+            vals = self.tree_dias.item(sel[0], "values")
+            if vals and (vals[0] == data_digitada or vals[1] == data_digitada):
+                total_previsto = str(vals[3])
+
+        confirmacao = messagebox.askyesno(
+            "Excluir Protocolos do Dia",
+            f"ATENÇÃO: Deseja realmente apagar TODOS os protocolos da data '{data_digitada}' do banco de dados?\n\n"
+            f"• Registros estimados: {total_previsto}\n"
+            "• Os protocolos serão excluídos definitivamente do SQLite.\n"
+            "• A planilha de trabalho ativa será atualizada automaticamente sem esses protocolos.\n"
+            "• Uma cópia de segurança da planilha atual será guardada em 'Planilhas anteriores/'.\n\n"
+            "Esta ação não pode ser desfeita. Continuar?",
+            icon="warning",
+        )
+        if not confirmacao:
+            return
+
+        def _executar() -> dict[str, Any]:
+            return apagar_dia_banco(data_digitada, atualizar_planilha=True)
+
+        def _on_sucesso(res: dict[str, Any]) -> None:
+            if res.get("sucesso"):
+                messagebox.showinfo("Sucesso", res["mensagem"])
+                self.ent_data_excluir.delete(0, tk.END)
+                self.atualizar_tudo()
+                self.lbl_status.config(
+                    text=f"Exclusão concluída: {res['removidos']} protocolos da data {res['data_formatada']} apagados."
+                )
+            else:
+                messagebox.showwarning("Aviso", res.get("mensagem", "Nenhum protocolo removido."))
+
+        self._executar_com_loading(
+            target_fn=_executar,
+            titulo="Excluindo Protocolos do Dia",
+            mensagem=f"Apagando protocolos da data {data_digitada} e atualizando a planilha ativa...",
+            on_sucesso=_on_sucesso,
+        )
+
+    def limpar_csvs_disco(self) -> None:
+        """Limpa quaisquer arquivos CSV antigos acumulados em processados/."""
+        qtd = limpar_csvs_processados()
+        if qtd > 0:
+            messagebox.showinfo("Limpeza Concluída", f"{qtd} arquivo(s) CSV legado(s) foram removidos do disco.")
+        else:
+            messagebox.showinfo("Limpeza Concluída", "Nenhum arquivo CSV antigo pendente de remoção.")
+        self.lbl_status.config(text=f"Varredura de CSVs concluída: {qtd} arquivos removidos.")
+
     def atualizar_tudo(self) -> None:
         """Recarrega os dados em todas as abas e componentes da interface.
 
         Complexity:
-            Tempo: O(F + C + M) onde F é o total de fiscais, C o total de CEPs e M o total de competências.
-            Espaço: O(F + C + M).
+            Tempo: O(F + C + M + D) onde F=fiscais, C=CEPs, M=competências e D=dias.
+            Espaço: O(F + C + M + D).
         """
         self.atualizar_combobox_fiscais()
         self.carregar_ultimos_fiscais()
@@ -1291,6 +1519,7 @@ class PainelAdminVRE:
         self.carregar_ceps_mapeados()
         self.carregar_ceps_pendentes()
         self.carregar_lotes_arquivamento()
+        self.carregar_dias_importados()
         try:
             stats = obter_estatisticas_gerais()
             total_ceps = len(listar_ceps_mapeados())
@@ -1381,6 +1610,27 @@ def executar_modo_cli(args: argparse.Namespace) -> None:
             print(f"    - {l['mes_competencia']}: {st} | Total={l['total']}, Pend={l['pendentes']}, Fin={l['finalizados']}")
         return
 
+    if getattr(args, "listar_dias", False):
+        dias = listar_dias_importados()
+        print(f"[*] Remessas Diárias Registradas ({len(dias)}):")
+        for d in dias:
+            print(
+                f"    - Data: {d['data_formatada']} ({d['data_importacao']}) | "
+                f"Total={d['total']}, Pend={d['pendentes']}, Dist={d['distribuidos']}, Fin={d['finalizados']} | "
+                f"Comp={d['competencias']}"
+            )
+        return
+
+    if getattr(args, "apagar_dia", None):
+        dia_alvo = args.apagar_dia.strip()
+        print(f"[*] Excluindo protocolos da data '{dia_alvo}' do banco de dados...")
+        res = apagar_dia_banco(dia_alvo, atualizar_planilha=True)
+        if res.get("sucesso"):
+            print(f"    [✓] {res['mensagem']}")
+        else:
+            print(f"    [!] {res.get('mensagem', 'Falha ao excluir protocolos.')}")
+        return
+
     # Se nenhum comando específico foi passado, exibe o painel de status padrão
     print("=" * 60)
     print("SMAURB - PAINEL ADMINISTRATIVO VRE (MODO CLI / MANUTENÇÃO)")
@@ -1428,6 +1678,8 @@ def main() -> None:
     parser.add_argument("--bairro", type=str, help="Bairro de referência para o CEP")
     parser.add_argument("--listar-pendentes", action="store_true", help="Lista CEPs pendentes de mapeamento")
     parser.add_argument("--listar-lotes", action="store_true", help="Lista lotes de competência e progresso")
+    parser.add_argument("--listar-dias", action="store_true", help="Lista todas as datas de importação registradas e totais")
+    parser.add_argument("--apagar-dia", type=str, help="Apaga todos os protocolos da data informada (AAAA-MM-DD ou DD/MM/AAAA) e atualiza a planilha ativa")
     args = parser.parse_args()
 
     tem_comando_cli = any([
@@ -1439,6 +1691,8 @@ def main() -> None:
         args.mapear_cep,
         args.listar_pendentes,
         args.listar_lotes,
+        args.listar_dias,
+        args.apagar_dia,
     ])
 
     if tem_comando_cli or not TKINTER_DISPONIVEL:

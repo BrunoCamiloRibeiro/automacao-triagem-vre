@@ -39,6 +39,8 @@ class TestAdminGuiIntegridade(unittest.TestCase):
             self.assertTrue(hasattr(painel, "tree_cep"), "tree_cep deve existir no PainelAdminVRE")
             self.assertTrue(hasattr(painel, "tree_hist"), "tree_hist deve existir no PainelAdminVRE")
             self.assertTrue(hasattr(painel, "tree_lotes"), "tree_lotes deve existir no PainelAdminVRE")
+            self.assertTrue(hasattr(painel, "tree_dias"), "tree_dias deve existir no PainelAdminVRE")
+            self.assertTrue(hasattr(painel, "ent_data_excluir"), "ent_data_excluir deve existir no PainelAdminVRE")
             self.assertTrue(hasattr(painel, "ent_form_cep"), "ent_form_cep deve existir")
             self.assertTrue(hasattr(painel, "cb_form_area"), "cb_form_area deve existir")
             self.assertTrue(hasattr(painel, "ent_form_bairro"), "ent_form_bairro deve existir")
@@ -52,6 +54,8 @@ class TestAdminGuiIntegridade(unittest.TestCase):
             self.assertTrue(hasattr(painel, "_executar_com_loading"), "_executar_com_loading deve existir")
             self.assertTrue(hasattr(painel, "ordenar_treeview"), "ordenar_treeview deve existir")
             self.assertTrue(hasattr(painel, "carregar_ultimos_fiscais"), "carregar_ultimos_fiscais deve existir")
+            self.assertTrue(hasattr(painel, "carregar_dias_importados"), "carregar_dias_importados deve existir")
+            self.assertTrue(hasattr(painel, "excluir_dia_selecionado"), "excluir_dia_selecionado deve existir")
 
             # Verifica método de obtenção de áreas
             areas = painel._obter_areas_disponiveis()

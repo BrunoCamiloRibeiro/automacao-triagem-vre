@@ -26,7 +26,11 @@ from src.core.normalizer import (
     normalizar_cep,
     normalizar_cnpj,
 )
-from src.runner.main_seco import extrair_mes_competencia, processar_fluxo_seco
+from src.runner.main_seco import (
+    extrair_mes_competencia,
+    limpar_csvs_processados,
+    processar_fluxo_seco,
+)
 
 
 class TestCasosDeBorda(unittest.TestCase):
@@ -208,6 +212,50 @@ class TestCasosDeBorda(unittest.TestCase):
         row = cur.fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row["fiscal_atribuido"], "Fiscal_Designado")
+
+    def test_remocao_csv_apos_processamento_e_limpeza(self) -> None:
+        """Verifica se arquivos CSV em pasta de entrada são apagados após a execução e se CSVs legados são limpos."""
+        import src.core.config as cfg
+        from unittest.mock import patch
+
+        pasta_fake_entrada = self.root / "entrada_fake"
+        pasta_fake_entrada.mkdir()
+        csv_prod = pasta_fake_entrada / "remessa_producao.csv"
+        conteudo = (
+            "ProtocoloSil;ProtocoloLicenca;Cnpj;NomeEmpresarial;Telefone;E-mail;TipoEndereco;Logradouro;Numero;"
+            "Complemento;Bairro;Cep;FinalidadeEndereco;CnaesNaoLicenciadas;CnaesLicenciadas;Iptu\n"
+            "SIL_DEL;LIC_DEL;88.777.666/0001-55;EMPRESA DELETE;17999;del@del.com;RUA;CENTRAL;10;"
+            ";CENTRO;15010000;ATIVIDADE;;561120100;123456\n"
+        )
+        csv_prod.write_text(conteudo, encoding="utf-8")
+        self.assertTrue(csv_prod.exists())
+
+        # Cria arquivo legado na pasta de processados
+        pasta_fake_proc = self.root / "proc_fake"
+        pasta_fake_proc.mkdir()
+        csv_legado = pasta_fake_proc / "antigo_2026.csv"
+        csv_legado.write_text("legado", encoding="utf-8")
+
+        with patch.object(cfg, "ENTRADA_CSV_DIR", pasta_fake_entrada), \
+             patch("src.runner.main_seco.ENTRADA_CSV_DIR", pasta_fake_entrada), \
+             patch.object(cfg, "PROCESSADOS_CSV_DIR", pasta_fake_proc), \
+             patch("src.runner.main_seco.PROCESSADOS_CSV_DIR", pasta_fake_proc):
+
+            # Executa o processamento
+            processar_fluxo_seco(
+                caminho_csv=csv_prod,
+                saida_xlsx=self.root / "saida_del.xlsx",
+                silencioso=True,
+                triagem_db_path=self.db_t,
+                cep_db_path=self.db_c,
+                template_path=self.root / "template_del.xlsx",
+            )
+
+            # O arquivo CSV processado NÃO deve mais existir (apagado após a execução)
+            self.assertFalse(csv_prod.exists(), "O arquivo CSV processado deve ser apagado após execução")
+
+            # O arquivo CSV legado em processados também deve ter sido limpo
+            self.assertFalse(csv_legado.exists(), "Arquivos legados em processados devem ser limpos")
 
 
 if __name__ == "__main__":

@@ -10,11 +10,14 @@ import openpyxl
 
 from src.admin.archive_service import (
     alternar_status_competencia,
+    apagar_dia_banco,
     aplicar_reorganizacao_planilha,
     arquivar_competencia,
     buscar_historico_fiscais,
     definir_status_competencia,
     listar_competencias_status,
+    listar_dias_importados,
+    normalizar_data_filtro,
     obter_estatisticas_gerais,
     reativar_competencia,
 )
@@ -172,6 +175,88 @@ class TestArchiveService(unittest.TestCase):
         res2 = buscar_historico_fiscais("BOA SORTE", conn=self.conn)
         self.assertEqual(len(res2), 1)
         self.assertEqual(res2[0]["fiscal"], "Fiscal_Beta")
+
+    def test_normalizar_data_filtro(self) -> None:
+        """Verifica a harmonização de formatos heterogêneos de data para AAAA-MM-DD."""
+        self.assertEqual(normalizar_data_filtro("21/10/2026"), "2026-10-21")
+        self.assertEqual(normalizar_data_filtro("2026-10-21"), "2026-10-21")
+        self.assertEqual(normalizar_data_filtro("21-10-2026"), "2026-10-21")
+        self.assertEqual(normalizar_data_filtro("2026/10/21"), "2026-10-21")
+        self.assertEqual(normalizar_data_filtro(""), "")
+        self.assertEqual(normalizar_data_filtro(None), "")
+
+    def test_listar_dias_importados(self) -> None:
+        """Verifica a consolidação correta de dias, totais e status por remessa diária."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO vre_backlog (protocolo_licenca, cnpj_limpo, mes_competencia, data_importacao, status)
+            VALUES ('D1_1', '11111111000111', '2026-10', '2026-10-20', 'PENDENTE'),
+                   ('D1_2', '22222222000122', '2026-10', '2026-10-20', 'FINALIZADO'),
+                   ('D2_1', '33333333000133', '2026-10', '2026-10-21', 'DISTRIBUIDO');
+            """
+        )
+
+        dias = listar_dias_importados(self.conn)
+        self.assertEqual(len(dias), 2)
+
+        # Ordenado por data mais recente primeiro
+        self.assertEqual(dias[0]["data_importacao"], "2026-10-21")
+        self.assertEqual(dias[0]["data_formatada"], "21/10/2026")
+        self.assertEqual(dias[0]["total"], 1)
+        self.assertEqual(dias[0]["distribuidos"], 1)
+
+        self.assertEqual(dias[1]["data_importacao"], "2026-10-20")
+        self.assertEqual(dias[1]["data_formatada"], "20/10/2026")
+        self.assertEqual(dias[1]["total"], 2)
+        self.assertEqual(dias[1]["pendentes"], 1)
+        self.assertEqual(dias[1]["finalizados"], 1)
+
+    def test_apagar_dia_banco(self) -> None:
+        """Verifica a exclusão atômica de uma remessa diária específica e regeração da planilha."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO vre_backlog (protocolo_licenca, protocolo_sil, cnpj_limpo, cnpj_formatado, nome_empresarial, mes_competencia, data_importacao, status, flag_restricao, flag_noturno, tipo_servico)
+            VALUES ('P_ERR_1', 'SIL-1', '11111111000111', '11.111.111/0001-11', 'EMPRESA ERRADA 1', '2026-10', '2026-10-21', 'PENDENTE', 0, 0, 'Sem Restricao Livre'),
+                   ('P_ERR_2', 'SIL-2', '22222222000122', '22.222.222/0001-22', 'EMPRESA ERRADA 2', '2026-10', '2026-10-21', 'PENDENTE', 0, 0, 'Sem Restricao Livre'),
+                   ('P_OK_1',  'SIL-3', '33333333000133', '33.333.333/0001-33', 'EMPRESA CORRETA',  '2026-10', '2026-10-20', 'PENDENTE', 0, 0, 'Sem Restricao Livre');
+            """
+        )
+
+        # 1. Cria planilha ativa inicial com os 3 registros
+        res_ini = aplicar_reorganizacao_planilha(conn=self.conn, saida_xlsx=self.saida_xlsx)
+        self.assertEqual(res_ini["linhas_geradas"], 3)
+
+        # 2. Apaga o dia errado informado no formato brasileiro '21/10/2026'
+        res_del = apagar_dia_banco(
+            "21/10/2026",
+            conn=self.conn,
+            atualizar_planilha=True,
+            saida_xlsx=self.saida_xlsx,
+        )
+        self.assertTrue(res_del["sucesso"])
+        self.assertEqual(res_del["removidos"], 2)
+        self.assertEqual(res_del["data_iso"], "2026-10-21")
+        self.assertEqual(res_del["linhas_planilha_ativa"], 1)
+
+        # 3. Verifica integridade do SQLite: apenas o protocolo de 2026-10-20 permanece
+        cur.execute("SELECT protocolo_licenca FROM vre_backlog;")
+        restantes = [r[0] for r in cur.fetchall()]
+        self.assertEqual(restantes, ["P_OK_1"])
+
+        # 4. Verifica se a planilha ativa no disco foi atualizada e tem apenas 1 linha de dados
+        wb = openpyxl.load_workbook(self.saida_xlsx, data_only=True)
+        ws = wb.active
+        # Linha 1: Meta, Linha 2: Header, Linha 3: 'EMPRESA CORRETA'
+        self.assertEqual(ws.max_row, 3)
+        self.assertEqual(ws.cell(3, 19).value, "EMPRESA CORRETA")
+        wb.close()
+
+        # 5. Tenta apagar data inexistente: deve retornar sucesso=False e removidos=0
+        res_inex = apagar_dia_banco("15/01/2020", conn=self.conn, atualizar_planilha=False)
+        self.assertFalse(res_inex["sucesso"])
+        self.assertEqual(res_inex["removidos"], 0)
 
 
 if __name__ == "__main__":
